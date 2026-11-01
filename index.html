@@ -13,35 +13,52 @@
   html,body{margin:0;padding:0;width:100%;height:100%;background:#0b0b0d;overflow:hidden;
     -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
     -webkit-tap-highlight-color:transparent;overscroll-behavior:none;touch-action:none}
-  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
-  #panel{display:block;touch-action:none;border-radius:15px;
+  #stage{position:fixed;inset:0;overflow:hidden}
+  /* the panel is scaled with a transform: one GPU composite, no per-frame reflow */
+  #panel{position:absolute;left:50%;top:50%;width:1000px;height:750px;margin:-375px 0 0 -500px;
+    touch-action:none;border-radius:15px;background:#0b0b0d;transform-origin:50% 50%;
+    will-change:transform;backface-visibility:hidden;
     box-shadow:0 26px 70px rgba(0,0,0,.8),0 1px 0 rgba(255,255,255,.05)}
+  #panel canvas{position:absolute;display:block;pointer-events:none}
+  #base{left:0;top:0;width:1000px;height:750px}
+  #screenlv{left:112px;top:86px;width:384px;height:192px}
+  #fvallv{left:36px;top:690px;width:222px;height:30px}
+  #dyn{left:0;top:0;width:0;height:0}
 </style>
 </head>
 <body>
-<div id="stage"><canvas id="panel" width="1000" height="750"></canvas></div>
+<div id="stage"><div id="panel"><canvas id="base" width="1000" height="750"></canvas><canvas id="screenlv" width="384" height="192"></canvas><canvas id="dyn" width="1" height="1"></canvas></div></div>
 <script>
 "use strict";
 /* ============================================================================
    ELEKTRON DIGITONE — CANVAS FRONT PANEL
    ----------------------------------------------------------------------------
-   RENDERING ARCHITECTURE (tuned for iPad 5 / A9)
-   1. STATIC LAYER — casing, print, button faces, encoder bodies are rasterised
-      once into an offscreen canvas.
-   2. REGION LAYER  — the panel is split into 57 dirty regions (screen, each
-      encoder, each pad, status plate…). Touching a knob repaints ONLY its own
-      region + the screen + the status plate: one small blit each instead of a
-      2000x1500 full-canvas repaint. No text/geometry outside a region is ever
-      re-submitted to the GPU.
-   3. DIRTY FLAG    — "needsRedraw" gates the whole loop; with nothing moving,
-      the sequencer stopped and REC off the loop schedules nothing at all (0%).
-   4. OLED SCREEN   — a 128x64 buffer (exactly like the hardware display) drawn
-      with a pre-baked bitmap-font atlas, one drawImage per glyph instead of
-      ~15 fillRects, then up-scaled 3x with smoothing OFF.
+   RENDERING ARCHITECTURE (tuned for iPad 5 / A9, iOS 16)
+   1. STATIC SURFACE — chassis, print, button faces, encoder bodies and every
+      LED ring are rasterised ONCE into #base. It is never repainted, so its
+      texture is uploaded to the GPU exactly one time.
+   2. LIVE SURFACES  — iOS re-uploads a canvas texture whenever that canvas is
+      painted, so surface AREA is the frame budget. Three small surfaces float
+      above #base:
+        #screenlv  384x192  the 128x64 OLED, refreshed when the screen changes
+        #fvallv    222x30   the status strip value (the only footer part that
+                            moves while a knob is dragged)
+        #dyn       ~160x200 a free canvas that is MOVED AND RESIZED to the
+                            bounding box of whatever else went dirty; its old
+                            pixels are committed into #base before it moves.
+      A knob drag therefore touches ~0.35 MP instead of the 3 MP of the full
+      retina panel, and the encoder ring itself only ~0.09 MP.
+   3. DIRTY FLAG    — needsRedraw gates the loop; with nothing moving and the
+      sequencer stopped the loop schedules nothing at all (0% CPU).
+   4. OLED SCREEN   — a real 128x64 buffer drawn with two pre-baked bitmap
+      faces (6x8 hardware face + 3x5 label face), exactly like the hardware.
+      The static skeleton is cached, so a value change costs one 128x64 blit
+      plus a handful of glyphs instead of a full redraw. It is up-scaled 3x
+      with smoothing OFF.
    5. INPUT         — touchmove only records the finger position; values are
-      applied once per animation frame (coalesced), so a 120 Hz digitiser can
-      never queue more work than the renderer can draw.
-   ========================================================================== */
+      applied once per animation frame (coalesced), and while a knob is moving
+      the OLED is refreshed at ~33 Hz while the ring keeps the full frame rate.
+      ========================================================================== */
 
 /* ---------------------------------------------------------------- 1. STATE */
 
@@ -53,6 +70,8 @@ const ratio = v => (0.25 + v / MAXV * 7.75).toFixed(2);
 const hz    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8)));
 const ratioS = v => (0.25 + v / MAXV * 7.75).toFixed(1);
 const hzS    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8) / 1000));
+const hz4    = v => { const h = 20 * Math.pow(2, v / MAXV * 9.8);
+                      return h >= 1000 ? (h / 1000).toFixed(1) + "K" : String(Math.round(h)); };
 const en = (...n) => v => n[Math.min(n.length - 1, Math.round(v / MAXV * (n.length - 1)))];
 
 const PAGES = ["SYN1", "SYN2", "FLTR", "AMP", "LFO"];
@@ -66,9 +85,9 @@ const PAGE_DEFS = {
     { k: "detune",   l: "DETUNE", f: bip,   s: bip },
     { k: "feedback", l: "FEEDBK",  f: pct,   s: pct },
     { k: "mix",      l: "MIX",    f: pct,   s: pct },
-    { k: "ratioC",   l: "RAT C",  f: ratio, s: ratioS },
-    { k: "ratioA",   l: "RAT A",  f: ratio, s: ratioS },
-    { k: "ratioB",   l: "RAT B",  f: ratio, s: ratioS },
+    { k: "ratioC",   l: "RAT C",  f: ratio, s: ratio },
+    { k: "ratioA",   l: "RAT A",  f: ratio, s: ratio },
+    { k: "ratioB",   l: "RAT B",  f: ratio, s: ratio },
     { k: "level",    l: "LEVEL",  f: pct,   s: pct }
   ],
   SYN2: [
@@ -82,7 +101,7 @@ const PAGE_DEFS = {
     { k: "level",  l: "LEVEL",  f: pct, s: pct }
   ],
   FLTR: [
-    { k: "freq",      l: "FREQ",   f: hz,  s: hzS },
+    { k: "freq",      l: "FREQ",   f: hz,  s: hz4 },
     { k: "resonance", l: "RESO",   f: pct, s: pct },
     { k: "type",      l: "TYPE",   f: en("LP4", "LP2", "HP2", "BP2", "NOT"), s: en("LP4", "LP2", "HP2", "BP2", "NOT") },
     { k: "env",       l: "ENV",    f: bip, s: bip },
@@ -123,15 +142,15 @@ const PAGE_DEFAULTS = {
 
 /* OLED page layouts — mirrors the hardware screen structure */
 const SCREEN_SPEC = {
-  SYN1: { tab: "SYN", num: "1", big: "1", cap: "ALGO", group: "RATIO",   boxLbl: ["C", "A", "B"],
-          thumbs: [["HRM", "wave"], ["DTN", "bars"], ["FBK", "diamond"], ["MIX", "xy"]] },
-  SYN2: { tab: "SYN", num: "2", big: "2", cap: "ALGO", group: "MOD",     boxLbl: ["PHS", "DRF", "SPR"],
-          thumbs: [["MOD", "wave"], ["MDF", "bars"], ["ATR", "diamond"], ["BTR", "xy"]] },
-  FLTR: { tab: "FLT", num: "1", big: "1", cap: "TYPE", group: "FILTER",  boxLbl: ["KEY", "DRV", "PAN"],
+  SYN1: { tab: "SYN", num: "1", big: "1", cap: "ALGO", group: "RATIO",    boxLbl: ["C", "A", "B"],
+          thumbs: [["HARM", "wave"], ["DTUN", "bars"], ["FDBK", "diamond"], ["MIX", "xy"]] },
+  SYN2: { tab: "SYN", num: "2", big: "2", cap: "ALGO", group: "MOD",      boxLbl: ["PHS", "DRF", "SPR"],
+          thumbs: [["MOD", "wave"], ["MODF", "bars"], ["ATRK", "diamond"], ["BTRK", "xy"]] },
+  FLTR: { tab: "FLT", num: "1", big: "1", cap: "TYPE", group: "FILTER",   boxLbl: ["KEY", "DRV", "PAN"],
           thumbs: [["FRQ", "curve"], ["RES", "bars"], ["TYP", "diamond"], ["ENV", "xy"]] },
-  AMP:  { tab: "AMP", num: "1", big: "1", cap: "ENV",  group: "ENVELOPE", boxLbl: ["VOL", "OVR", "PAN"],
+  AMP:  { tab: "AMP", num: "1", big: "1", cap: "ENV",  group: "ENVELOPE",  boxLbl: ["VOL", "OVR", "PAN"],
           thumbs: [["ATK", "env"], ["DEC", "bars"], ["SUS", "bars"], ["REL", "xy"]] },
-  LFO:  { tab: "LFO", num: "1", big: "1", cap: "SHP",  group: "LFO",      boxLbl: ["DEP", "DST", "MUL"],
+  LFO:  { tab: "LFO", num: "1", big: "1", cap: "SHP",  group: "LFO",       boxLbl: ["DEP", "DST", "MUL"],
           thumbs: [["SPD", "wave"], ["SHP", "bars"], ["FAD", "diamond"], ["PHS", "xy"]] }
 };
 
@@ -255,8 +274,25 @@ const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
 
 /* ---------------------------------------------------------- 4. CANVAS/DPR */
 
-const canvas = document.getElementById("panel");
-const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+/* LAYERED SURFACES ---------------------------------------------------------
+   base     — the static artwork, rasterised once (never repainted)
+   screenlv — the 128x64 OLED at 3x, painted only when the screen changes
+   dyn      — a tiny canvas that is MOVED AND RESIZED to the bounding box of
+              the dirty regions, so a knob drag touches ~30k pixels instead of
+              the 3 000 000 of the full retina panel. On iOS every canvas paint
+              re-uploads that canvas' texture, so surface area is everything.
+   bg       — hidden copy of the pure static art, the repair source for regions */
+const panelEl = document.getElementById("panel");
+const baseEl  = document.getElementById("base");
+const sEl     = document.getElementById("screenlv");
+const fEl     = document.getElementById("fvallv");
+const dEl     = document.getElementById("dyn");
+const baseCtx = baseEl.getContext("2d", { alpha: false, desynchronized: true });
+const sCtx    = sEl.getContext("2d", { alpha: true });
+const fCtx    = fEl.getContext("2d", { alpha: true });
+const dCtx    = dEl.getContext("2d", { alpha: true });
+let ctx = baseCtx;                       /* current paint target */
+let panelRect = { left: 0, top: 0, width: 1000, height: 750 };
 
 const bg = document.createElement("canvas");
 const bgc = bg.getContext("2d");
@@ -288,47 +324,130 @@ function invalidate() {
   if (!rafId) rafId = requestAnimationFrame(frame);
 }
 
-function blitRegion(r) {
-  const x = Math.max(0, Math.floor(r.x * dpr));
-  const y = Math.max(0, Math.floor(r.y * dpr));
-  const w = Math.min(bg.width - x, Math.ceil(r.w * dpr) + 1);
-  const h = Math.min(bg.height - y, Math.ceil(r.h * dpr) + 1);
-  if (w > 0 && h > 0) ctx.drawImage(bg, x, y, w, h, x, y, w, h);
+/* repair source: copy the static artwork back under a region */
+function blitBg(dst, r, ox, oy) {
+  const sx = Math.round(r.x * dpr), sy = Math.round(r.y * dpr);
+  const sw = Math.round((r.x + r.w) * dpr) - sx, sh = Math.round((r.y + r.h) * dpr) - sy;
+  if (sw <= 0 || sh <= 0) return;
+  dst.drawImage(bg, sx, sy, sw, sh, Math.round((r.x - ox) * dpr), Math.round((r.y - oy) * dpr), sw, sh);
 }
 
-function paintDirty() {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  for (const name of dirty) {
-    const r = REGIONS.get(name);
-    if (r) blitRegion(r);
-  }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  for (const name of dirty) {
-    const r = REGIONS.get(name);
+/* SURFACES -----------------------------------------------------------------
+   Every region is painted on one of three surfaces. Two of them are small and
+   FIXED (the OLED and the footer value strip); the third is a free canvas that
+   is moved and resized to the bounding box of whatever else went dirty. iOS
+   re-uploads a canvas texture on every paint, so surface area is the budget.  */
+const SURF = [
+  { id: "screen", el: sEl, ctx: sCtx, fixed: true,  x: 112, y: 86, w: 384, h: 192 },
+  { id: "fval",   el: fEl, ctx: fCtx, fixed: true,  x: 36,  y: 690, w: 222, h: 30 },
+  { id: "dyn",    el: dEl, ctx: dCtx, fixed: false, x: 0, y: 0, w: 0, h: 0 }
+];
+const surfaceOf = name => name === "screen" ? 0 : (name === "fval" ? 1 : 2);
+const SURF_OF_NAME = { screen: "screen", fval: "fval" };
+let dynX2 = 0, dynY2 = 0;                      /* current dyn rect (CSS px) */
+
+function commitDyn() {
+  const sf = SURF[2];
+  if (sf.w <= 0 || sf.h <= 0) return;
+  baseCtx.setTransform(1, 0, 0, 1, 0, 0);
+  baseCtx.drawImage(sf.el, Math.round(sf.x * dpr), Math.round(sf.y * dpr));
+  baseCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  sf.w = sf.h = 0;
+}
+
+function paintSurface(sf) {
+  const names = [];
+  const id = sf.id;
+  for (const n of dirty) if (SURF_OF_NAME[n] === id || (id === "dyn" && !SURF_OF_NAME[n])) names.push(n);
+  if (!names.length) return;
+
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < names.length; i++) {
+    const r = REGIONS.get(names[i]);
     if (!r) continue;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(r.x, r.y, r.w, r.h);
-    ctx.clip();
-    r.draw();
-    ctx.restore();
+    if (r.x < x0) x0 = r.x;
+    if (r.y < y0) y0 = r.y;
+    if (r.x + r.w > x1) x1 = r.x + r.w;
+    if (r.y + r.h > y1) y1 = r.y + r.h;
   }
+  if (x1 < x0) { names.forEach(n => dirty.delete(n)); return; }
+
+  const bx = Math.max(0, Math.floor(x0)), by = Math.max(0, Math.floor(y0));
+  const bw = Math.max(1, Math.min(W, Math.ceil(x1)) - bx);
+  const bh = Math.max(1, Math.min(H, Math.ceil(y1)) - by);
+  const c = sf.ctx;
+
+  if (sf.fixed) {
+    /* fixed surface: exactly the union of its regions, repaint whole */
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, sf.el.width, sf.el.height);
+  } else if (bx !== sf.x || by !== sf.y || bw !== sf.w || bh !== sf.h) {   /* dyn only */
+    commitDyn();                                     /* keep the older pixels */
+    sf.x = bx; sf.y = by; sf.w = bw; sf.h = bh;
+    sf.el.style.left = bx + "px"; sf.el.style.top = by + "px";
+    sf.el.style.width = bw + "px"; sf.el.style.height = bh + "px";
+    sf.el.width = Math.max(1, Math.round(bw * dpr));
+    sf.el.height = Math.max(1, Math.round(bh * dpr));
+  }
+
+  const ox = sf.fixed ? sf.x : bx, oy = sf.fixed ? sf.y : by;
+  const prev = ctx;
+  for (let i = 0; i < names.length; i++) {
+    const r = REGIONS.get(names[i]);
+    if (!r) continue;
+    if (!sf.fixed) {
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.clearRect(Math.round((r.x - ox) * dpr) - 1, Math.round((r.y - oy) * dpr) - 1,
+                  Math.round(r.w * dpr) + 2, Math.round(r.h * dpr) + 2);
+    }
+    blitBg(c, r, ox, oy);
+    ctx = c;
+    c.setTransform(dpr, 0, 0, dpr, -ox * dpr, -oy * dpr);
+    r.draw();                                        /* no clip(): the surface bounds it */
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    dirty.delete(names[i]);
+  }
+  ctx = prev;
+}
+
+let lastScreenAt = 0;
+
+function paintDirty() {
+  if (!dirty.size) return;
+  /* while a knob is moving the OLED is refreshed at ~33 Hz and the encoder
+     ring at the full frame rate — the finger follows the pixel, the digits
+     follow the eye. Cuts the largest surface upload by a third.            */
+  const now = performance.now();
+  const hold = drags.size > 0 && dirty.has("screen") && (now - lastScreenAt) < 30;
+  if (!hold) { lastScreenAt = now; paintSurface(SURF[0]); }
+  paintSurface(SURF[1]);
+  paintSurface(SURF[2]);
   dirty.clear();
+  if (hold) { dirty.add("screen"); invalidate(); }
 }
 
 /* full repaint — first frame, resize, orientation change */
 function drawUI() {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.drawImage(bg, 0, 0);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  commitDyn();
+  baseCtx.setTransform(1, 0, 0, 1, 0, 0);
+  baseCtx.drawImage(bg, 0, 0);
+  baseCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const prev = ctx;
+  ctx = baseCtx;
   REGIONS.forEach(r => {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(r.x, r.y, r.w, r.h);
-    ctx.clip();
+    if (SURF_OF_NAME[r.name]) return;
+    baseCtx.save();
+    baseCtx.beginPath();
+    baseCtx.rect(r.x, r.y, r.w, r.h);
+    baseCtx.clip();
     r.draw();
-    ctx.restore();
+    baseCtx.restore();
   });
+  ctx = prev;
+  oledDirty = true;                       /* full repaint always refreshes the OLED */
+  dirty.add("screen"); dirty.add("fval");
+  paintSurface(SURF[0]);
+  paintSurface(SURF[1]);
   dirty.clear();
   needsRedraw = false;
 }
@@ -348,15 +467,22 @@ function frame() {
 
 function resize() {
   const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.995;
-  canvas.style.width = (W * s) + "px";
-  canvas.style.height = (H * s) + "px";
-  const d = Math.min(window.devicePixelRatio || 1, 2);     /* cap: A9 fill-rate */
+  panelEl.style.transform = "scale(" + s + ")";           /* one GPU composite */
+  const d = Math.min(window.devicePixelRatio || 1, 2);    /* cap: A9 fill-rate */
   if (d !== dpr || bg.width !== Math.round(W * d)) {
     dpr = d;
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
+    baseEl.width = Math.round(W * dpr);
+    baseEl.height = Math.round(H * dpr);
+    sEl.width = Math.round(G.screen.w * dpr);
+    sEl.height = Math.round(G.screen.h * dpr);
+    fEl.width = Math.round(222 * dpr);
+    fEl.height = Math.round(30 * dpr);
+    SURF[2].w = SURF[2].h = 0;
+    dEl.width = dEl.height = 1;
     buildStatic();
   }
+  const r = panelEl.getBoundingClientRect();
+  panelRect = { left: r.left, top: r.top, width: r.width, height: r.height };
   drawUI();
   invalidate();
 }
@@ -701,91 +827,221 @@ function dottedV(x, y0, y1) { octx.fillStyle = FG; for (let y = y0; y <= y1; y +
 
 /* ----------------------------------------------------------- screen render */
 
-function renderOLED() {
-  const c = octx;
-  c.fillStyle = BG;
-  c.fillRect(0, 0, SW, SH);
+/* --- small 3x5 face: every label and value on the hardware screen --------- */
+const GLS = {
+  " ": [0,0,0,0,0],
+  "0": [7,5,5,5,7], "1": [2,6,2,2,7], "2": [6,1,2,4,7], "3": [6,1,2,1,6],
+  "4": [5,5,7,1,1], "5": [7,4,6,1,6], "6": [3,4,7,5,7], "7": [7,1,2,2,2],
+  "8": [7,5,7,5,7], "9": [7,5,7,1,6],
+  "A": [2,5,7,5,5], "B": [6,5,6,5,6], "C": [3,4,4,4,3], "D": [6,5,5,5,6],
+  "E": [7,4,6,4,7], "F": [7,4,6,4,4], "G": [3,4,5,5,3], "H": [5,5,7,5,5],
+  "I": [7,2,2,2,7], "J": [1,1,1,5,2], "K": [5,5,6,5,5], "L": [4,4,4,4,7],
+  "M": [5,7,7,5,5], "N": [5,7,5,5,5], "O": [7,5,5,5,7], "P": [6,5,6,4,4],
+  "Q": [2,5,5,6,3], "R": [6,5,6,5,5], "S": [3,4,2,1,6], "T": [7,2,2,2,2],
+  "U": [5,5,5,5,7], "V": [5,5,5,5,2], "W": [5,5,7,7,5], "X": [5,5,2,5,5],
+  "Y": [5,5,2,2,2], "Z": [7,1,2,4,7],
+  ".": [0,0,0,0,2], ":": [0,2,0,2,0], "-": [0,0,7,0,0], "+": [0,2,7,2,0],
+  "/": [1,1,2,4,4], "%": [5,1,2,4,5], ">": [4,2,1,2,4], "<": [1,2,4,2,1],
+  "=": [0,7,0,7,0], "*": [0,5,2,5,0], "!": [2,2,2,0,2], "#": [5,7,5,7,5]
+};
+const SORDER = Object.keys(GLS);
+const SIDX = {};
+SORDER.forEach((ch, i) => { SIDX[ch] = i; });
 
-  const tr = state.tracks[state.currentTrack];
-  const page = state.currentPage;
-  const defs = PAGE_DEFS[page];
-  const spec = SCREEN_SPEC[page];
-  const pv = tr.params[page];
-  const v = i => pv[defs[i].k];
-  const sel = state.selParam;
-
-  /* ---- header: bank/pattern · name · tempo ----------------------------- */
-  fillBox(1, 1, 22, 10);
-  pxText(3, 2, state.bank + state.patternNo, "bg");
-
-  const tempo = state.bpm.toFixed(1);
-  const tw = textW(tempo);
-  const tx = 126 - tw;
-  const nameMax = Math.max(0, Math.floor((tx - 32 + 1) / 6));
-  pxText(23, 2, state.patternName.slice(0, nameMax), "fg");
-
-  fillBox(tx - 9, 1, tw + 10, 10);
-  /* transport glyph + tempo, both knocked out of the filled box */
-  octx.fillStyle = BG;
-  if (state.isPlaying) {
-    for (let i = 0; i < 5; i++) octx.fillRect(tx - 8, 3 + i, 1, 7 - i * 2);
-    for (let i = 0; i < 4; i++) octx.fillRect(tx - 7 + i, 3 + i, 1, 7 - i * 2);
-  } else {
-    octx.fillRect(tx - 8, 3, 5, 6);
-  }
-  pxText(tx, 2, tempo, "bg");
-
-  /* ---- page tab -------------------------------------------------------- */
-  box(1, 14, 22, 24);
-  pxText(2, 15, spec.tab, "fg");
-  pxText(7, 22, spec.num, "fg", 2);          /* large page number */
-
-  /* ---- level meter ----------------------------------------------------- */
-  const lvl = Math.max(0.06, v(7) / MAXV);
-  dashBox(1, 41, 22, 13);
-  octx.fillStyle = FG;
-  octx.fillRect(3, 45, Math.round(18 * lvl), 4);
-  octx.fillRect(3, 45, 1, 4);
-  for (let i = 3; i <= 21; i += 4) octx.fillRect(i, 50, 1, 1);
-  pxText(4, 55, defs[7].l.replace("LEVEL", "LEV").slice(0, 3), "fg");
-
-  /* ---- centre graphic -------------------------------------------------- */
-  drawScreenGraphic(page, pv);
-
-  /* ---- big value box + caption ---------------------------------------- */
-  box(48, 14, 17, 17);
-  pxText(52, 16, spec.big, "fg", 2);
-  pxText(48, 32, spec.cap, "fg");
-
-  /* ---- three value boxes ---------------------------------------------- */
-  const boxX = [65, 86, 107];
-  const boxW = 20;
-  for (let i = 0; i < 3; i++) {
-    const idx = 4 + i;
-    const x = boxX[i];
-    pxText(x + ((boxW - textW(spec.boxLbl[i])) >> 1), 11, spec.boxLbl[i], "fg");
-    if (sel === idx) {
-      fillBox(x, 19, boxW, 12);
-      pxText(x + 1, 21, defs[idx].s(v(idx)), "bg");
-    } else {
-      box(x, 19, boxW, 12);
-      pxText(x + 1, 21, defs[idx].s(v(idx)), "fg");
+function buildAtlasS(color) {
+  const cv = document.createElement("canvas");
+  cv.width = SORDER.length * 4;
+  cv.height = 5;
+  const c = cv.getContext("2d");
+  c.fillStyle = color;
+  for (let i = 0; i < SORDER.length; i++) {
+    const g = GLS[SORDER[i]];
+    for (let r = 0; r < 5; r++) {
+      const bits = g[r];
+      if (!bits) continue;
+      for (let b = 0; b < 3; b++) if (bits & (4 >> b)) c.fillRect(i * 4 + b, r, 1, 1);
     }
   }
-  pxText(65 + ((62 - textW(spec.group)) >> 1), 32, spec.group, "fg");
+  return cv;
+}
+const ATLAS_S = { fg: null, bg: null };
 
-  /* ---- four thumbnails ------------------------------------------------- */
-  const thumbX = [44, 65, 86, 107];
+function sText(x, y, s, col) {
+  const a = ATLAS_S[col === "bg" ? "bg" : "fg"];
+  if (!a) return;
+  for (let i = 0; i < s.length; i++) {
+    const id = SIDX[s[i]];
+    if (id === undefined) continue;
+    octx.drawImage(a, id * 4, 0, 3, 5, x + i * 4, y, 3, 5);
+  }
+}
+const sW = s => s.length * 4 - 1;
+
+/* --- hardware box styles: 1px chamfer, filled chips, pill bars ------------ */
+function rbox(x, y, w, h) {
+  octx.fillStyle = FG;
+  octx.fillRect(x + 1, y, w - 2, 1);
+  octx.fillRect(x + 1, y + h - 1, w - 2, 1);
+  octx.fillRect(x, y + 1, 1, h - 2);
+  octx.fillRect(x + w - 1, y + 1, 1, h - 2);
+}
+function rfill(x, y, w, h) {
+  octx.fillStyle = FG;
+  octx.fillRect(x + 1, y, w - 2, h);
+  octx.fillRect(x, y + 1, w, h - 2);
+}
+function pill(x, y, w, h) {                    /* small rounded value bar */
+  octx.fillStyle = FG;
+  octx.fillRect(x + 1, y, w - 2, h);
+  octx.fillRect(x, y + 1, w, h - 2);
+}
+
+/* --- layout, measured off the real panel --------------------------------- */
+const LY = {
+  chip:   { x: 0, y: 0, w: 18, h: 9 },
+  name:   { x: 20, y: 1 },
+  tempo:  { x: 86, y: 0, w: 42, h: 9 },
+  tab:    { x: 0, y: 12, w: 16, h: 23 },
+  meter:  { x: 0, y: 38, w: 16, h: 13 },
+  tree:   { ax: 21, ay: 24, bx: 33, by: 12, cx: 21, cy: 37, w: 11, h: 9 },
+  algo:   { x: 48, y: 12, w: 17, h: 18 },
+  boxes:  [67, 87, 107], boxW: 19, boxY: 12, boxH: 18,
+  thumbs: [48, 68, 88, 108], thumbW: 18, thumbY: 37, thumbH: 13
+};
+
+const oledSk = document.createElement("canvas");
+oledSk.width = SW; oledSk.height = SH;
+const skc = oledSk.getContext("2d");
+let OLED_KEY = "";
+
+/* skeleton: everything that only changes with page / track / selection */
+function drawOLEDSkeleton(page, spec, sel) {
+  octx.fillStyle = BG;
+  octx.fillRect(0, 0, SW, SH);
+
+  /* header — bank/pattern chip, name, tempo chip */
+  rfill(LY.chip.x, LY.chip.y, LY.chip.w, LY.chip.h);
+  sText(LY.chip.x + 3, LY.chip.y + 2, state.bank + state.patternNo, "bg");
+
+  const t = LY.tempo;
+  rfill(t.x, t.y, t.w, t.h);
+  octx.fillStyle = BG;
+  if (state.isPlaying) {                        /* transport glyph */
+    for (let i = 0; i < 5; i++) octx.fillRect(t.x + 2, t.y + 2 + i, 1, 5 - i);
+    for (let i = 0; i < 4; i++) octx.fillRect(t.x + 3 + i, t.y + 2 + i, 1, 5 - i);
+  } else {
+    octx.fillRect(t.x + 2, t.y + 2, 4, 5);
+  }
+  const bpm = state.bpm.toFixed(1);
+  pxText(t.x + t.w - 4 - textW(bpm), t.y + 1, bpm, "bg");
+
+  const nameW = t.x - 2 - LY.name.x;
+  const nMax = Math.max(0, Math.floor((nameW + 1) / 6));
+  pxText(LY.name.x, LY.name.y, state.patternName.slice(0, nMax), "fg");
+
+  /* page tab */
+  rbox(LY.tab.x, LY.tab.y, LY.tab.w, LY.tab.h);
+  sText(2, LY.tab.y + 1, spec.tab, "fg");
+  pxText(3, LY.tab.y + 7, spec.num, "fg", 2);
+
+  /* level meter frame */
+  dashBox(LY.meter.x, LY.meter.y, LY.meter.w, LY.meter.h);
+  sText(2, LY.meter.y + LY.meter.h + 2, "LEV", "fg");
+
+  /* centre: operator tree (SYN pages) or nothing (graph is dynamic) */
+  if (page === "SYN1" || page === "SYN2") {
+    const T = LY.tree, w = T.w, h = T.h, o = 3;
+    const blk = (x, y, ch) => { rbox(x, y, w, h); pxText(x + o, y + 1, ch, "fg"); };
+    blk(T.bx, T.by, "B");
+    blk(T.ax, T.ay, "A");
+    blk(T.bx, T.ay, "B");
+    blk(T.cx, T.cy, "C");
+    vLine(T.bx + 5, T.by + h, T.ay - 1);           /* B top -> B mid */
+    hLine(T.ax + w, T.ax + w, T.ay + 4);           /* A -> B mid */
+    vLine(T.ax + 5, T.ay + h, T.cy - 1);           /* A -> C */
+    dottedV(T.cx + 5, T.cy + h, 50);
+    dottedV(T.bx + 5, T.ay + h, 50);
+    sText(T.cx + 3, 52, "X", "fg");
+    sText(T.bx + 3, 52, "Y", "fg");
+  }
+
+  /* algorithm box + caption */
+  const A = LY.algo;
+  rbox(A.x, A.y, A.w, A.h);
+  pxText(A.x + 4, A.y + 2, spec.big, "fg", 2);
+  sText(A.x, A.y + A.h + 1, spec.cap, "fg");
+
+  /* three value boxes: letter notched into the top edge */
+  for (let i = 0; i < 3; i++) {
+    const x = LY.boxes[i];
+    if (sel === 4 + i) rfill(x, LY.boxY, LY.boxW, LY.boxH);
+    else rbox(x, LY.boxY, LY.boxW, LY.boxH);
+    const on = sel === 4 + i;
+    octx.fillStyle = on ? FG : BG;
+    octx.fillRect(x + 2, LY.boxY, 6, 1);           /* notch in the border   */
+    sText(x + 4, LY.boxY, spec.boxLbl[i], on ? "bg" : "fg");
+  }
+  const grp = spec.group;
+  sText(LY.boxes[0] + ((LY.boxes[2] + LY.boxW - LY.boxes[0] - sW(grp)) >> 1), 30, grp, "fg");
+
+  /* four parameter thumbnails + captions */
   for (let i = 0; i < 4; i++) {
-    const x = thumbX[i];
-    if (sel === i) fillBox(x, 39, 21, 14);
-    else box(x, 39, 21, 14);
-    drawThumb(spec.thumbs[i][1], x + 3, 41, 15, 10, v(i), sel === i);
-    pxText(x + ((21 - textW(spec.thumbs[i][0])) >> 1), 54, spec.thumbs[i][0], "fg");
+    const x = LY.thumbs[i];
+    if (sel === i) rfill(x, LY.thumbY, LY.thumbW, LY.thumbH);
+    else rbox(x, LY.thumbY, LY.thumbW, LY.thumbH);
+    const lbl = spec.thumbs[i][0];
+    sText(x + ((LY.thumbW - sW(lbl)) >> 1), LY.thumbY + LY.thumbH + 2, lbl, "fg");
   }
 }
 
-/* mini graphics for the thumbnail row */
+/* dynamic layer: values, bars, thumbnails, meter, graph */
+function drawOLEDDynamic(page, spec, sel, defs, v) {
+  for (let i = 0; i < 3; i++) {
+    const idx = 4 + i, x = LY.boxes[i];
+    sText(x + 2, 17, defs[idx].s(v(idx)), sel === idx ? "bg" : "fg");
+    const bx = x + 2, bw = LY.boxW - 5;
+    octx.fillStyle = sel === idx ? BG : FG;
+    octx.fillRect(bx, 24, bw, 3);
+    octx.fillStyle = sel === idx ? BG : FG;
+    octx.fillRect(bx, 25, Math.max(1, Math.round(bw * v(idx) / MAXV)), 1);
+  }
+  for (let i = 0; i < 4; i++) {
+    drawThumb(spec.thumbs[i][1], LY.thumbs[i] + 3, LY.thumbY + 2, LY.thumbW - 6, LY.thumbH - 4,
+              v(i), sel === i);
+  }
+  if (page !== "SYN1" && page !== "SYN2") drawScreenGraphic(page, v);
+
+  /* level meter: vertical bar inside the dashed frame */
+  const lvl = Math.max(0.05, v(7) / MAXV);
+  const m = LY.meter, h = Math.round((m.h - 4) * lvl);
+  octx.fillStyle = FG;
+  octx.fillRect(m.x + 6, m.y + m.h - 2 - h, 5, h);
+  octx.fillRect(m.x + 6, m.y + 1, 1, 1);
+}
+
+function renderOLED() {
+  const page = state.currentPage;
+  const defs = PAGE_DEFS[page];
+  const spec = SCREEN_SPEC[page];
+  const pv = state.tracks[state.currentTrack].params[page];
+  const sel = state.selParam;
+  const v = i => pv[defs[i].k];
+
+  const key = page + "|" + state.currentTrack + "|" + sel + "|" + state.bpm.toFixed(1) + "|" +
+              (state.isPlaying ? 1 : 0) + "|" + state.bank + state.patternNo + "|" + state.patternName;
+  if (key !== OLED_KEY) {                 /* only the skeleton changed rarely */
+    OLED_KEY = key;
+    drawOLEDSkeleton(page, spec, sel);
+    skc.clearRect(0, 0, SW, SH);
+    skc.drawImage(oled, 0, 0);
+  } else {
+    octx.clearRect(0, 0, SW, SH);
+    octx.drawImage(oledSk, 0, 0);
+  }
+  drawOLEDDynamic(page, spec, sel, defs, v);
+  oledDirty = false;
+}
+
 function drawThumb(kind, x, y, w, h, val, inverted) {
   const col = inverted ? BG : FG;
   octx.fillStyle = col;
@@ -841,84 +1097,64 @@ function drawThumb(kind, x, y, w, h, val, inverted) {
 }
 
 /* the FM algorithm / filter / envelope / LFO drawing, hardware position */
-function drawScreenGraphic(page, pv) {
+function drawScreenGraphic(page, v) {
+  const X = 21, Y = 12, Wd = 25, Hd = 21;
   octx.fillStyle = FG;
   octx.strokeStyle = FG;
   octx.lineWidth = 1;
-
-  if (page === "SYN1" || page === "SYN2") {
-    /* A, B, C operator blocks with routing and X/Y mod destinations */
-    const b = (x, y, ch) => {
-      box(x, y, 9, 9);
-      pxText(x + 2, y + 1, ch, "fg");
-    };
-    b(35, 14, "B");
-    b(23, 26, "A");
-    b(35, 26, "B");
-    b(23, 38, "C");
-    vLine(39, 23, 25);                 /* B top -> B mid */
-    hLine(32, 34, 30);                 /* A -> B mid */
-    vLine(27, 35, 37);                 /* A -> C */
-    dottedV(27, 47, 52);
-    dottedV(39, 35, 52);
-    pxText(25, 54, "X", "fg");
-    pxText(37, 54, "Y", "fg");
-    return;
-  }
+  const base = Y + Hd;
 
   if (page === "FLTR") {
-    const fc = 0.1 + (pv.freq / MAXV) * 0.8;
-    const res = pv.resonance / MAXV;
+    const fc = 0.15 + v(0) / MAXV * 0.7;
+    const res = v(1) / MAXV;
     octx.beginPath();
-    for (let i = 0; i <= 22; i++) {
-      const t = i / 22;
+    for (let i = 0; i <= Wd; i++) {
+      const t = i / Wd;
       const g = 1 / Math.sqrt(1 + Math.pow(t / fc, 8));
-      const bump = res * 0.9 * Math.exp(-Math.pow((t - fc) * 22, 2));
-      const val = Math.min(1 + res * 0.85, g * (1 + bump));
-      const yy = 33 - (val / (1 + res * 0.85)) * 17;
-      i ? octx.lineTo(25 + i, yy) : octx.moveTo(25 + i, yy);
+      const bump = res * 0.9 * Math.exp(-Math.pow((t - fc) * 9, 2));
+      const val = Math.min(1.25, g * (1 + bump));
+      const yy = base - val * (Hd - 2);
+      i ? octx.lineTo(X + i, yy) : octx.moveTo(X + i, yy);
     }
     octx.stroke();
-    hLine(25, 47, 36);
+    hLine(X, X + Wd, base);
     return;
   }
-
   if (page === "AMP") {
-    const a = 0.03 + (pv.attack / MAXV) * 0.16;
-    const d = 0.10 + (pv.decay / MAXV) * 0.2;
-    const s = pv.sustain / MAXV;
-    const r = 0.12 + (pv.release / MAXV) * 0.3;
-    const xs = [0, a, a + d, a + d + 0.22, a + d + 0.22 + r];
-    const ys = [36, 14, 36 - s * 21, 36 - s * 21, 36];
+    const a = 0.04 + v(0) / MAXV * 0.16;
+    const d = 0.14 + v(1) / MAXV * 0.24;
+    const sus = v(2) / MAXV;
+    const r = 0.16 + v(3) / MAXV * 0.3;
+    const xs = [0, a, a + d, a + d + 0.24, a + d + 0.24 + r];
+    const top = Y + 2;
+    const ys = [base, top, base - sus * (Hd - 3), base - sus * (Hd - 3), base];
     octx.beginPath();
     for (let i = 0; i < xs.length; i++) {
-      const px = 25 + (xs[i] / xs[4]) * 22;
+      const px = X + (xs[i] / xs[4]) * Wd;
       i ? octx.lineTo(px, ys[i]) : octx.moveTo(px, ys[i]);
     }
     octx.stroke();
-    hLine(25, 47, 36);
+    hLine(X, X + Wd, base);
     return;
   }
-
-  /* LFO */
-  const shape = Math.round(pv.shape / MAXV * 5);
-  const cyc = 1 + Math.round(pv.speed / MAXV * 2);
+  const shape = Math.round(v(1) / MAXV * 5);
+  const cyc = 1 + Math.round(v(0) / MAXV * 2);
+  const cy = Y + Hd / 2;
   octx.beginPath();
-  for (let i = 0; i <= 22; i++) {
-    const ph = ((i / 22) * cyc) % 1;
+  for (let i = 0; i <= Wd; i++) {
+    const ph = ((i / Wd) * cyc) % 1;
     let val;
-    if (shape === 2) val = ph < 0.5 ? 1 : -1;
+    if (shape === 1) val = 1 - 4 * Math.abs(ph - 0.5);
+    else if (shape === 2) val = ph < 0.5 ? 1 : -1;
     else if (shape === 3) val = 1 - 2 * ph;
-    else if (shape === 1) val = 1 - 4 * Math.abs(ph - 0.5);
-    else if (shape === 3) val = 1 - 2 * ph;
+    else if (shape === 4) val = ((i * 7) % 5) / 2 - 1;
+    else if (shape === 5) val = Math.pow(ph * 2 - 1, 3);
     else val = Math.sin(ph * Math.PI * 2);
-    const yy = 25 - val * 9;
-    i ? octx.lineTo(25 + i, yy) : octx.moveTo(25 + i, yy);
+    const yy = cy - val * (Hd / 2 - 2);
+    i ? octx.lineTo(X + i, yy) : octx.moveTo(X + i, yy);
   }
   octx.stroke();
 }
-
-/* ======================================================== DYNAMIC WIDGETS */
 
 const A0 = -Math.PI / 2 - Math.PI * 0.75;
 const SPAN = Math.PI * 1.5;
@@ -949,7 +1185,7 @@ function ring(x, y, r, value, hot) {
 }
 
 function drawScreenRegion() {
-  if (oledDirty) { renderOLED(); oledDirty = false; }
+  if (oledDirty) renderOLED();
   const s = G.screen;
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(oled, s.x, s.y, s.w, s.h);
@@ -988,15 +1224,12 @@ function drawKnobRegion(k, idx) {
 }
 
 function goldFace(b) {
-  if (!b._gold) {
-    const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
-    g.addColorStop(0, "#f4c469");
-    g.addColorStop(0.5, "#d9a03c");
-    g.addColorStop(1, "#b1771f");
-    b._gold = g;
-  }
+  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  g.addColorStop(0, "#f4c469");
+  g.addColorStop(0.5, "#d9a03c");
+  g.addColorStop(1, "#b1771f");
   rr(ctx, b.x, b.y, b.w, b.h, 8);
-  ctx.fillStyle = b._gold;
+  ctx.fillStyle = g;
   ctx.fill();
   ctx.strokeStyle = "rgba(255,228,166,.7)";
   ctx.lineWidth = 1;
@@ -1280,6 +1513,29 @@ function drawRecRegion() {
   }
 }
 
+/* the only part of the status plate that changes while a knob is dragged */
+function drawFooterValue() {
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page][state.selParam];
+  const val = state.tracks[state.currentTrack].params[page][def.k];
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = F.small;
+  ctx.fillStyle = "#77777f";
+  ctx.fillText(page + "  /  " + def.l, 44, 703);
+  ctx.textAlign = "right";
+  ctx.font = "700 11px " + UI;
+  ctx.fillStyle = "#ffcc00";
+  ctx.fillText(def.f(val), 250, 703);
+  rr(ctx, 44, 712, 206, 4, 2);
+  ctx.fillStyle = "#26262b";
+  ctx.fill();
+  rr(ctx, 44, 712, Math.max(2, 206 * val / MAXV), 4, 2);
+  ctx.fillStyle = "#d9a03c";
+  ctx.fill();
+  ctx.textAlign = "left";
+}
+
 function drawFooterRegion() {
   const tr = state.tracks[state.currentTrack];
   const page = state.currentPage;
@@ -1303,22 +1559,7 @@ function drawFooterRegion() {
   ctx.fillStyle = "#8b8b95";
   ctx.fillText(state.bank + state.patternNo + "  " + state.patternName, 44, 683);
 
-  ctx.font = F.small;
-  ctx.fillStyle = "#77777f";
-  ctx.fillText(page + "  /  " + def.l, 44, 703);
-
-  ctx.textAlign = "right";
-  ctx.font = "700 11px " + UI;
-  ctx.fillStyle = "#ffcc00";
-  ctx.fillText(def.f(val), 250, 703);
-
-  rr(ctx, 44, 712, 206, 4, 2);
-  ctx.fillStyle = "#26262b";
-  ctx.fill();
-  rr(ctx, 44, 712, Math.max(2, 206 * val / MAXV), 4, 2);
-  ctx.fillStyle = "#d9a03c";
-  ctx.fill();
-
+  drawFooterValue();
   ctx.textAlign = "left";
   ctx.font = F.small;
   ctx.fillStyle = "#63636d";
@@ -1383,6 +1624,7 @@ function buildRegions() {
   addRegion("leds", 790, 434, 190, 28, drawLedsRegion);
   addRegion("rec", G.recPanel.x, G.recPanel.y, G.recPanel.w, G.recPanel.h, drawRecRegion);
   addRegion("footer", G.footer.x, G.footer.y, G.footer.w, G.footer.h, drawFooterRegion);
+  addRegion("fval", 36, 690, 222, 30, drawFooterValue);
 }
 buildRegions();
 
@@ -1391,8 +1633,8 @@ buildRegions();
 const PRESSED = new Set();
 
 function canvasPoint(cx, cy) {
-  const r = canvas.getBoundingClientRect();
-  return { x: (cx - r.left) / r.width * W, y: (cy - r.top) / r.height * H };
+  return { x: (cx - panelRect.left) / panelRect.width * W,
+           y: (cy - panelRect.top) / panelRect.height * H };
 }
 
 const HITS = [];
@@ -1524,7 +1766,7 @@ function pointerUp(id) {
 }
 
 /* touch ------------------------------------------------------------------- */
-canvas.addEventListener("touchstart", e => {
+panelEl.addEventListener("touchstart", e => {
   e.preventDefault();
   audioUnlock();
   const t = e.changedTouches;
@@ -1534,7 +1776,7 @@ canvas.addEventListener("touchstart", e => {
   }
 }, { passive: false });
 
-canvas.addEventListener("touchmove", e => {
+panelEl.addEventListener("touchmove", e => {
   e.preventDefault();
   const t = e.changedTouches;
   for (let i = 0; i < t.length; i++) {
@@ -1546,12 +1788,12 @@ canvas.addEventListener("touchmove", e => {
 function endTouch(e) {
   for (let i = 0; i < e.changedTouches.length; i++) pointerUp(e.changedTouches[i].identifier);
 }
-canvas.addEventListener("touchend", endTouch, { passive: true });
-canvas.addEventListener("touchcancel", endTouch, { passive: true });
+panelEl.addEventListener("touchend", endTouch, { passive: true });
+panelEl.addEventListener("touchcancel", endTouch, { passive: true });
 
 /* mouse (desktop) ---------------------------------------------------------- */
 let mouseDown = false;
-canvas.addEventListener("mousedown", e => {
+panelEl.addEventListener("mousedown", e => {
   e.preventDefault();
   audioUnlock();
   const p = canvasPoint(e.clientX, e.clientY);
@@ -1569,7 +1811,7 @@ window.addEventListener("mouseup", () => {
   pointerUp("mouse");
 });
 
-canvas.addEventListener("contextmenu", e => e.preventDefault());
+panelEl.addEventListener("contextmenu", e => e.preventDefault());
 document.addEventListener("gesturestart", e => e.preventDefault());
 document.addEventListener("dblclick", e => e.preventDefault());
 
@@ -1981,6 +2223,8 @@ function saveWav() {
 
 ATLAS.fg = buildAtlas(FG);
 ATLAS.bg = buildAtlas(BG);
+ATLAS_S.fg = buildAtlasS(FG);
+ATLAS_S.bg = buildAtlasS(BG);
 octx.imageSmoothingEnabled = false;
 
 buildHits();
