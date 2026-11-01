@@ -28,6 +28,8 @@
 </head>
 <body>
 <div id="stage"><div id="panel"><canvas id="base" width="1000" height="750"></canvas><canvas id="screenlv" width="384" height="192"></canvas><canvas id="dyn" width="1" height="1"></canvas></div></div>
+<input id="filein" type="file" accept="application/json,.json" tabindex="-1"
+       style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none">
 <script>
 "use strict";
 /* ============================================================================
@@ -169,6 +171,7 @@ const state = {
   masterVol: 104,
   fine: false,
   unison: false,
+  midi: false,
   patternName: "SIDEBANDER",
   bank: "A",
   patternNo: "01",
@@ -454,15 +457,9 @@ function drawUI() {
 
 function frame() {
   rafId = 0;
-  if (state.isPlaying) consumeScheduledSteps();
   applyDrags();
-  if (state.isRecordingWav) {
-    touch("rec");
-    const t = recTime();
-    if (t !== frame.lastRec) { frame.lastRec = t; touch("footer"); }
-  }
   if (dirty.size) { paintDirty(); needsRedraw = false; }
-  if (state.isPlaying || state.isRecordingWav) rafId = requestAnimationFrame(frame);
+  /* nothing to animate -> the loop stops and the GPU goes idle (0% CPU) */
 }
 
 function resize() {
@@ -1319,6 +1316,7 @@ function buttonActive(id) {
   if (id === "play") return state.isPlaying;
   if (id === "func") return state.fine;
   if (id === "unison") return state.unison;
+  if (id === "midi") return state.midi;
   if (id.indexOf("page") === 0 && id.length === 5) return PAGES[+id.slice(4)] === state.currentPage;
   return false;
 }
@@ -1372,15 +1370,12 @@ function drawTrackRegion(t) {
   const on = state.currentTrack === t.i;
   const rgb = TRACK_RGB[t.i];
   if (on) {
-    if (!t._g) {
-      const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
-      g.addColorStop(0, "rgba(" + rgb + ",1)");
-      g.addColorStop(0.6, "rgba(" + rgb + ",.82)");
-      g.addColorStop(1, "rgba(" + rgb + ",.55)");
-      t._g = g;
-    }
+    const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
+    g.addColorStop(0, "rgba(" + rgb + ",1)");
+    g.addColorStop(0.6, "rgba(" + rgb + ",.82)");
+    g.addColorStop(1, "rgba(" + rgb + ",.55)");
     rr(ctx, t.x, t.y, t.w, t.h, 9);
-    ctx.fillStyle = t._g;
+    ctx.fillStyle = g;
     ctx.fill();
     ctx.strokeStyle = "rgba(255,255,255,.55)";
     ctx.lineWidth = 1.5;
@@ -1404,24 +1399,35 @@ function drawTrackRegion(t) {
   ctx.fillStyle = on ? "rgba(255,255,255,.98)" : "rgba(" + rgb + ",.85)";
   ctx.fillText("T" + (t.i + 1), t.x + t.w / 2, t.y + t.h / 2 - 5);
   ctx.font = F.tiny;
-  ctx.fillStyle = on ? "rgba(255,255,255,.65)" : "rgba(255,255,255,.28)";
-  ctx.fillText("MUTE", t.x + t.w / 2, t.y + t.h - 13);
+  const muted = !!state.tracks[t.i].muted;
+  ctx.fillStyle = muted ? "rgba(255,255,255,.95)" : (on ? "rgba(255,255,255,.65)" : "rgba(255,255,255,.28)");
+  ctx.fillText(muted ? "MUTED" : "MUTE", t.x + t.w / 2, t.y + t.h - 13);
+  if (muted) {                                   /* struck-through = silent */
+    ctx.strokeStyle = "rgba(255,255,255,.75)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(t.x + 14, t.y + 12);
+    ctx.lineTo(t.x + t.w - 14, t.y + t.h - 12);
+    ctx.stroke();
+  }
 }
 
 function drawLedsRegion() {
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   ctx.font = "500 8.5px " + UI;
+  const beat = (state.isPlaying && state.currentStep >= 0) ? (state.currentStep >> 2) : 0;
   for (let i = 0; i < 4; i++) {
     const x = 806 + i * 46, y = 448;
+    const on = i === beat;
     ctx.beginPath();
     ctx.arc(x, y, 3.4, 0, 6.2832);
-    ctx.fillStyle = i === 0 ? "#ffb02e" : "#33333a";
+    ctx.fillStyle = on ? "#ffb02e" : "#33333a";
     ctx.fill();
     ctx.strokeStyle = "rgba(0,0,0,.6)";
     ctx.lineWidth = 1;
     ctx.stroke();
-    ctx.fillStyle = i === 0 ? "#c9c9d2" : "#6e6e78";
+    ctx.fillStyle = on ? "#c9c9d2" : "#6e6e78";
     ctx.fillText((i + 1) + ":4", x + 9, y + 0.5);
   }
 }
@@ -1456,13 +1462,10 @@ function drawRecRegion() {
   } else {
     ctx.beginPath();
     ctx.arc(r.x, r.y, r.r, 0, 6.2832);
-    if (!r._off) {
-      const g = ctx.createRadialGradient(r.x - 4, r.y - 5, 2, r.x, r.y, r.r);
-      g.addColorStop(0, "#74251f");
-      g.addColorStop(1, "#3a1210");
-      r._off = g;
-    }
-    ctx.fillStyle = r._off;
+    const g = ctx.createRadialGradient(r.x - 4, r.y - 5, 2, r.x, r.y, r.r);
+    g.addColorStop(0, "#74251f");
+    g.addColorStop(1, "#3a1210");
+    ctx.fillStyle = g;
     ctx.fill();
     ctx.strokeStyle = "rgba(255,90,74,.5)";
     ctx.lineWidth = 1.2;
@@ -1563,9 +1566,9 @@ function drawFooterRegion() {
   ctx.textAlign = "left";
   ctx.font = F.small;
   ctx.fillStyle = "#63636d";
-  ctx.fillText("TAP TRIG 1\u201316 TO TOGGLE STEPS", 300, 652);
-  ctx.fillText("DRAG ENCODERS A\u2013H UP / DOWN TO EDIT", 300, 668);
-  ctx.fillText("FUNC = FINE \u00b7 PAGE / \u25c0 \u25b6 = PARAM PAGE", 300, 684);
+  ctx.fillText("TRIG 1\u201316 = STEPS \u00b7 TRACK AGAIN = MUTE", 300, 652);
+  ctx.fillText("DRAG A\u2013H UP / DOWN \u00b7 ARROWS NUDGE", 300, 668);
+  ctx.fillText("NO = UNDO \u00b7 YES = REDO \u00b7 FUNC = FINE / ALT", 300, 684);
 
   ctx.textAlign = "right";
   ctx.font = F.bpm;
@@ -1818,7 +1821,13 @@ document.addEventListener("dblclick", e => e.preventDefault());
 /* =========================================================== 7. ACTIONS */
 
 function selectTrack(i) {
-  if (state.currentTrack === i) return;
+  if (state.currentTrack === i) {          /* second tap = mute, like FUNC+TRACK */
+    const tr = state.tracks[i];
+    tr.muted = !tr.muted;
+    touch("track:" + i);
+    toast("TRACK " + (i + 1) + (tr.muted ? " MUTED" : " UNMUTED"));
+    return;
+  }
   touch("track:" + state.currentTrack);
   state.currentTrack = i;
   state.selParam = 0;
@@ -1844,68 +1853,130 @@ function nextPage(dir) {
 }
 
 function nudge(dir) {
-  setParam(state.selParam, currentPageValue(state.selParam) + dir);
+  const step = state.fine ? 10 : 1;
+  setParam(state.selParam, currentPageValue(state.selParam) + dir * step);
 }
 
-let clip = null;
-function copyTrack() {
-  const t = state.tracks[state.currentTrack];
-  clip = { trigs: t.trigs.slice(), params: JSON.parse(JSON.stringify(t.params)) };
-  toast("TRACK " + (state.currentTrack + 1) + " COPIED");
-}
-function pasteTrack() {
-  if (!clip) { toast("NOTHING TO PASTE"); return; }
-  const t = state.tracks[state.currentTrack];
-  t.trigs = clip.trigs.slice();
-  t.params = JSON.parse(JSON.stringify(clip.params));
-  state.selParam = 0;
+function setBpm(v) {
+  const nb = clamp(Math.round(v * 10) / 10, 30, 300);
+  if (nb === state.bpm) return;
+  state.bpm = nb;
   oledDirty = true;
   touch("screen");
   touch("footer");
-  for (let k = 0; k < 16; k++) touch("trig:" + k);
-  for (let k = 0; k < 8; k++) touch("enc:" + k);
+}
+
+function toggleMidi() {
+  if (!navigator || !navigator.requestMIDIAccess) { toast("MIDI NOT AVAILABLE"); return; }
+  if (state.midi) {
+    state.midi = false;
+    touch("btn:midi");
+    toast("MIDI INPUT OFF");
+    return;
+  }
+  navigator.requestMIDIAccess({ sysex: false }).then(access => {
+    state.midi = true;
+    touch("btn:midi");
+    let count = 0;
+    access.inputs.forEach(inp => {
+      count++;
+      inp.onmidimessage = ev => {
+        const d = ev.data;
+        const cmd = d[0] & 0xf0;
+        if (cmd === 0x90 && d[2] > 0) previewVoice(state.currentTrack, d[1] % 8);
+      };
+    });
+    toast("MIDI IN \u00b7 " + count + " DEVICE" + (count === 1 ? "" : "S"));
+  }).catch(() => toast("MIDI DENIED"));
+}
+
+let clip = null;
+
+function copyTrack() {
+  const t = state.tracks[state.currentTrack];
+  clip = { trigs: t.trigs.slice(), params: JSON.parse(JSON.stringify(t.params)), muted: !!t.muted };
+  toast("TRACK " + (state.currentTrack + 1) + " COPIED");
+  touch("btn:paste");
+}
+
+function pasteTrack() {
+  if (!clip) { toast("NOTHING TO PASTE \u00b7 PRESS COPY"); return; }
+  pushUndo("PASTE");
+  const t = state.tracks[state.currentTrack];
+  t.trigs = clip.trigs.slice();
+  t.params = JSON.parse(JSON.stringify(clip.params));
+  t.muted = !!clip.muted;
+  state.selParam = 0;
+  refreshAll();
   toast("PASTED TO TRACK " + (state.currentTrack + 1));
 }
+
 function clearTrack() {
-  state.tracks[state.currentTrack].trigs.fill(0);
+  pushUndo("CLEAR");
+  const t = state.tracks[state.currentTrack];
+  t.trigs.fill(0);
+  for (const pg of PAGES) Object.assign(t.params[pg], JSON.parse(JSON.stringify(PAGE_DEFAULTS[pg])));
+  refreshAll();
+  toast("TRACK " + (state.currentTrack + 1) + " CLEARED \u00b7 NO = UNDO");
+}
+
+/* one call that repaints everything a structural change can touch */
+function refreshAll() {
   oledDirty = true;
   touch("screen");
+  touch("footer");
+  touch("fval");
   for (let k = 0; k < 16; k++) touch("trig:" + k);
-  toast("TRACK " + (state.currentTrack + 1) + " CLEARED");
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
+  for (let k = 0; k < 4; k++) touch("track:" + k);
 }
 
 function pressButton(id) {
+  if (id.indexOf("page") === 0 && id.length === 5) {
+    const idx = +id.slice(4);
+    const prev = PAGES.indexOf(state.currentPage);
+    if (idx === prev) { toast(PAGES[idx] + " PAGE"); return; }
+    state.currentPage = PAGES[idx];
+    state.selParam = 0;
+    oledDirty = true;
+    touch("screen");
+    touch("footer");
+    touch("fval");
+    touch("btn:page" + prev);
+    touch("btn:page" + idx);
+    for (let k = 0; k < 8; k++) touch("enc:" + k);
+    return;
+  }
   switch (id) {
-    case "play": case "yes": startPlay(); break;
-    case "stop": case "no": stopPlay(); break;
-    case "copy": copyTrack(); break;
-    case "clear": clearTrack(); break;
-    case "paste": pasteTrack(); break;
+    case "play":   if (state.isPlaying) stopPlay(); else startPlay(); break;
+    case "stop":   stopPlay(); break;
+    case "yes":    doRedo(); break;
+    case "no":     doUndo(); break;
+    case "copy":   copyTrack(); break;
+    case "clear":  clearTrack(); break;
+    case "paste":  pasteTrack(); break;
     case "saveprj": saveProject(); break;
-    case "impexp": loadProject(false); break;
-    case "unison": state.unison = !state.unison; toast("UNISON " + (state.unison ? "ON" : "OFF")); break;
-    case "func": state.fine = !state.fine; toast(state.fine ? "FINE EDIT" : "NORMAL EDIT"); break;
+    case "impexp": if (state.fine) importProject(); else exportProject(); break;
+    case "unison":
+      state.unison = !state.unison;
+      touch("btn:unison");
+      toast("UNISON " + (state.unison ? "ON \u00b7 3 VOICES" : "OFF"));
+      break;
+    case "func":
+      state.fine = !state.fine;
+      touch("btn:func");
+      toast(state.fine ? "FUNC ON \u00b7 FINE / ALT" : "FUNC OFF");
+      break;
     case "taptempo": tapTempo(); break;
-    case "page": nextPage(1); break;
-    case "left": nextPage(-1); break;
-    case "right": nextPage(1); break;
-    case "up": nudge(1); break;
-    case "down": nudge(-1); break;
-    case "midi": toast("MIDI CONFIG"); break;
+    case "midi":   toggleMidi(); break;
+    case "page":   nextPage(1); break;
+    case "left":   state.fine ? selectTrack((state.currentTrack + 3) % 4) : nextPage(-1); break;
+    case "right":  state.fine ? selectTrack((state.currentTrack + 1) % 4) : nextPage(1); break;
+    case "up":     state.fine ? setBpm(state.bpm + 1) : nudge(1); break;
+    case "down":   state.fine ? setBpm(state.bpm - 1) : nudge(-1); break;
     case "savewav": saveWav(); break;
-    case "rec": toggleRec(); break;
-    default:
-      if (id.indexOf("page") === 0 && id.length === 5) {
-        const prev = PAGES.indexOf(state.currentPage);
-        state.currentPage = PAGES[+id.slice(4)];
-        state.selParam = 0;
-        oledDirty = true;
-        touch("screen");
-        touch("footer");
-        touch("btn:page" + prev);
-        touch("btn:page" + id.slice(4));
-        for (let k = 0; k < 8; k++) touch("enc:" + k);
-      }
+    case "rec":    toggleRec(); break;
+    default: toast("?" + id);
   }
 }
 
@@ -1919,9 +1990,7 @@ function tapTempo() {
   if (tapGaps.length) {
     const avg = tapGaps.reduce((a, b) => a + b, 0) / tapGaps.length;
     const bpm = clamp(Math.round(600000 / avg) / 10, 30, 300);
-    state.bpm = bpm;
-    oledDirty = true;
-    touch("screen");
+    setBpm(bpm);
     toast("BPM " + bpm.toFixed(1));
   }
 }
@@ -1934,35 +2003,94 @@ function toast(msg) {
   toast.t = setTimeout(() => touch("footer"), 1780);
 }
 
+/* history ------------------------------------------------------------------ */
+const undoStack = [], redoStack = [];
+
+function serialize() {
+  return {
+    tracks: state.tracks.map(t => ({
+      trigs: t.trigs.slice(),
+      params: JSON.parse(JSON.stringify(t.params)),
+      muted: !!t.muted,
+      octave: t.octave || 0
+    })),
+    bpm: state.bpm,
+    masterVol: state.masterVol,
+    patternName: state.patternName,
+    bank: state.bank,
+    patternNo: state.patternNo,
+    unison: !!state.unison
+  };
+}
+
+function applyState(d) {
+  if (!d || !d.tracks || d.tracks.length !== 4) return false;
+  for (let i = 0; i < 4; i++) {
+    const src = d.tracks[i];
+    const trigs = new Array(16).fill(0);
+    (src.trigs || []).forEach((v, k) => { if (k < 16) trigs[k] = v ? 1 : 0; });
+    state.tracks[i].trigs = trigs;
+    state.tracks[i].muted = !!src.muted;
+    if (typeof src.octave === "number") state.tracks[i].octave = src.octave;
+    if (src.params) for (const pg of PAGES) if (src.params[pg]) Object.assign(state.tracks[i].params[pg], src.params[pg]);
+  }
+  if (typeof d.bpm === "number") state.bpm = clamp(d.bpm, 30, 300);
+  if (typeof d.masterVol === "number") state.masterVol = clamp(d.masterVol, 0, 127);
+  if (typeof d.patternName === "string") state.patternName = d.patternName.slice(0, 16).toUpperCase();
+  if (typeof d.bank === "string") state.bank = d.bank.slice(0, 1);
+  if (typeof d.patternNo === "string") state.patternNo = d.patternNo.slice(0, 2);
+  if (typeof d.unison === "boolean") state.unison = d.unison;
+  oledDirty = true;
+  touchAll();
+  return true;
+}
+
+function pushUndo(label) {
+  undoStack.push({ label: label, data: serialize() });
+  if (undoStack.length > 16) undoStack.shift();
+  redoStack.length = 0;
+  touch("btn:no");
+  touch("btn:yes");
+}
+
+function refreshHistoryButtons() {
+  touch("btn:no");
+  touch("btn:yes");
+  touch("footer");
+}
+
+function doUndo() {
+  if (!undoStack.length) { toast("NOTHING TO UNDO"); return; }
+  const e = undoStack.pop();
+  redoStack.push({ label: e.label, data: serialize() });
+  applyState(e.data);
+  refreshHistoryButtons();
+  toast("UNDO \u00b7 " + e.label);
+}
+
+function doRedo() {
+  if (!redoStack.length) { toast("NOTHING TO REDO"); return; }
+  const e = redoStack.pop();
+  undoStack.push({ label: e.label, data: serialize() });
+  applyState(e.data);
+  refreshHistoryButtons();
+  toast("REDO \u00b7 " + e.label);
+}
+
 /* persistence ------------------------------------------------------------- */
-const STORE_KEY = "digitone.panel.v2";
+const STORE_KEY = "digitone.panel.v3";
 function saveProject() {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({
-      tracks: state.tracks.map(t => ({ trigs: t.trigs, params: t.params })),
-      bpm: state.bpm, masterVol: state.masterVol
-    }));
+    localStorage.setItem(STORE_KEY, JSON.stringify(serialize()));
     toast("PROJECT SAVED");
   } catch (err) { toast("SAVE FAILED"); }
 }
+
 function loadProject(silent) {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (!raw) { if (!silent) toast("NO PROJECT FOUND"); return false; }
-    const d = JSON.parse(raw);
-    if (d.tracks && d.tracks.length === 4) {
-      for (let i = 0; i < 4; i++) {
-        const src = d.tracks[i];
-        const trigs = new Array(16).fill(0);
-        (src.trigs || []).forEach((v, k) => { if (k < 16) trigs[k] = v ? 1 : 0; });
-        state.tracks[i].trigs = trigs;
-        if (src.params) for (const p of PAGES) if (src.params[p]) Object.assign(state.tracks[i].params[p], src.params[p]);
-      }
-      if (typeof d.bpm === "number") state.bpm = d.bpm;
-      if (typeof d.masterVol === "number") state.masterVol = d.masterVol;
-    }
-    oledDirty = true;
-    touchAll();
+    if (!applyState(JSON.parse(raw))) { if (!silent) toast("BAD PROJECT"); return false; }
     if (!silent) toast("PROJECT LOADED");
     return true;
   } catch (err) {
@@ -1971,10 +2099,48 @@ function loadProject(silent) {
   }
 }
 
-/* ======================================================= 8. AUDIO ENGINE */
+/* file export / import ---------------------------------------------------- */
+function exportProject() {
+  try {
+    const blob = new Blob([JSON.stringify(serialize())], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "digitone-" + state.bank + state.patternNo + ".json";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 6000);
+    toast("EXPORTED " + state.bank + state.patternNo);
+  } catch (err) { toast("EXPORT FAILED"); }
+}
 
-let actx = null, masterGain = null, recNode = null;
-let recBufs = [], recLen = 0, recStart = 0;
+function importProject() {
+  const inp = document.getElementById("filein");
+  if (!inp) { toast("NO FILE PICKER"); return; }
+  inp.value = "";
+  inp.click();
+}
+
+function readProjectFile(file) {
+  const r = new FileReader();
+  r.onerror = () => toast("IMPORT FAILED");
+  r.onload = () => {
+    try {
+      const d = JSON.parse(String(r.result));
+      if (applyState(d)) { pushUndo("IMPORT"); toast("IMPORTED " + (d.bank || "") + (d.patternNo || "")); }
+      else toast("BAD PROJECT FILE");
+    } catch (e) { toast("NOT A PROJECT FILE"); }
+  };
+  r.readAsText(file);
+}
+
+let actx = null, masterGain = null;
+/* REC bounces the song offline: the audio thread renders it, the main thread
+   never sees a single sample callback, so the UI cannot drop a frame.        */
+let recBuffer = null, recLen = 0, recStart = 0, recBusy = false;
+const REC_BARS = 8;
 
 function gainFromVolume() { return Math.pow(state.masterVol / MAXV, 1.5) * 0.55; }
 
@@ -1988,46 +2154,31 @@ function audioUnlock() {
       masterGain.gain.value = gainFromVolume();
       masterGain.connect(actx.destination);
 
-      if (actx.createScriptProcessor) {
-        recNode = actx.createScriptProcessor(4096, 1, 1);
-        recNode.onaudioprocess = ev => {
-          if (!state.isRecordingWav) return;
-          const d = ev.inputBuffer.getChannelData(0);
-          recBufs.push(new Float32Array(d));
-          recLen += d.length;
-          if (recLen > actx.sampleRate * 180) stopRec(true);
-        };
-        masterGain.connect(recNode);
-        const mute = actx.createGain();
-        mute.gain.value = 0;
-        recNode.connect(mute);
-        mute.connect(actx.destination);
-      }
     }
     if (actx.state === "suspended") actx.resume();
   } catch (err) { actx = null; }
 }
 
-function voice(trackIdx, step, when) {
-  if (!actx) return;
+function buildVoice(c, dest, trackIdx, step, when, detune, gainDiv) {
   const tr = state.tracks[trackIdx];
   const syn = tr.params.SYN1, flt = tr.params.FLTR, amp = tr.params.AMP;
 
   const scale = [0, 3, 5, 7, 10, 12, 15, 17];
-  const f = 55 * Math.pow(2, (scale[step % 8] + tr.octave) / 12);
+  const f = 55 * Math.pow(2, (scale[step % 8] + (tr.octave || 0)) / 12);
   const rat = 0.5 + (syn.ratioA / MAXV) * 7.5;
   const idx = (syn.feedback / MAXV) * 5 + 0.2;
 
-  const car = actx.createOscillator();
-  const mod = actx.createOscillator();
-  const modGain = actx.createGain();
-  const vca = actx.createGain();
-  const lp = actx.createBiquadFilter();
+  const car = c.createOscillator();
+  const mod = c.createOscillator();
+  const modGain = c.createGain();
+  const vca = c.createGain();
+  const lp = c.createBiquadFilter();
 
   car.type = "sine"; mod.type = "sine";
   car.frequency.value = f * (0.5 + (syn.ratioC / MAXV) * 1.5);
   mod.frequency.value = car.frequency.value * rat;
   modGain.gain.value = car.frequency.value * idx;
+  if (detune) car.detune.value = detune;
 
   lp.type = "lowpass";
   lp.frequency.value = Math.min(16000, 80 * Math.pow(2, (flt.freq / MAXV) * 7.4));
@@ -2037,21 +2188,21 @@ function voice(trackIdx, step, when) {
   modGain.connect(car.frequency);
   car.connect(lp);
   lp.connect(vca);
-  vca.connect(masterGain);
+  vca.connect(dest);
 
-  const t = when || actx.currentTime + 0.005;
-  const peak = 0.16 * (amp.volume / MAXV) * (state.unison ? 0.8 : 1);
+  const t = Math.max(0.002, when);
+  const peak = 0.16 * (amp.volume / MAXV) * (gainDiv || 1);
   const a = 0.004 + Math.pow(amp.attack / MAXV, 2) * 0.5;
   const d = 0.03 + (amp.decay / MAXV) * 1.1;
-  const s = Math.max(0.001, amp.sustain / MAXV);
+  const sus = Math.max(0.001, amp.sustain / MAXV);
   const hold = 0.12;
   const r = 0.03 + (amp.release / MAXV) * 1.0;
   const end = t + a + d + hold + r;
 
   vca.gain.setValueAtTime(0.0001, t);
   vca.gain.linearRampToValueAtTime(peak, t + a);
-  vca.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak * s), t + a + d);
-  vca.gain.setValueAtTime(Math.max(0.0001, peak * s), t + a + d + hold);
+  vca.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak * sus), t + a + d);
+  vca.gain.setValueAtTime(Math.max(0.0001, peak * sus), t + a + d + hold);
   vca.gain.exponentialRampToValueAtTime(0.0001, end);
 
   car.start(t); mod.start(t);
@@ -2062,6 +2213,21 @@ function voice(trackIdx, step, when) {
       vca.disconnect(); lp.disconnect();
     } catch (e) {}
   };
+}
+
+function voicesInto(c, dest, trackIdx, step, when) {
+  if (state.unison) {
+    /* three detuned partials: the classic Digitone unison spread */
+    buildVoice(c, dest, trackIdx, step, when, -9, 0.55);
+    buildVoice(c, dest, trackIdx, step, when, 0, 0.7);
+    buildVoice(c, dest, trackIdx, step, when, 9, 0.55);
+  } else {
+    buildVoice(c, dest, trackIdx, step, when, 0, 1);
+  }
+}
+
+function voice(trackIdx, step, when) {
+  if (actx) voicesInto(actx, masterGain, trackIdx, step, when);
 }
 
 function previewVoice(trackIdx, step) {
@@ -2115,12 +2281,17 @@ function scheduler() {
   let guard = 0;
   while (nextTime < actx.currentTime + 0.15 && guard++ < 32) {
     const s = schedStep % 16;
-    for (let t = 0; t < 4; t++) if (state.tracks[t].trigs[s]) voice(t, s, nextTime);
+    for (let t = 0; t < 4; t++) {
+      const tr = state.tracks[t];
+      if (tr.muted) continue;
+      if (tr.trigs[s]) voice(t, s, nextTime);
+    }
     pending.push({ s: s, t: nextTime });
     if (pending.length > 24) pending.shift();
     nextTime += spb;
     schedStep++;
   }
+  consumeScheduledSteps();      /* the step LEDs are driven from here, not rAF */
 }
 
 function advanceStep(s) {
@@ -2128,6 +2299,7 @@ function advanceStep(s) {
   state.currentStep = s;
   if (prev >= 0) touch("trig:" + prev);
   touch("trig:" + s);
+  if ((prev >> 2) !== (s >> 2)) touch("leds");        /* 1:4 .. 4:4 indicator */
 }
 
 function consumeScheduledSteps() {
@@ -2144,44 +2316,83 @@ function fmtTime(sec) {
   return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
 }
 function recTime() {
-  const sr = actx ? actx.sampleRate : 44100;
-  if (state.isRecordingWav) return fmtTime((performance.now() - (recStart || performance.now())) / 1000);
-  return fmtTime(recLen / sr);
+  if (recBusy) return "BUSY";
+  if (recLen) return fmtTime(recLen / 44100);
+  return "00:00";
 }
 
 function toggleRec() {
   audioUnlock();
-  if (!actx) { toast("AUDIO UNAVAILABLE"); return; }
-  if (state.isRecordingWav) stopRec(false);
-  else startRec();
+  if (recBusy) { toast("BOUNCE IN PROGRESS"); return; }
+  startRec();
 }
 
+/* the whole song is rendered in an OfflineAudioContext - exact same synth
+   graph, but it runs faster than real time and never touches the UI thread */
 function startRec() {
-  if (!actx) return;
-  recBufs = [];
-  recLen = 0;
-  recStart = performance.now();
+  const Ctor = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!Ctor) { toast("NO OFFLINE AUDIO HERE"); return; }
+  if (recBusy) return;
+
+  recBusy = true;
   state.isRecordingWav = true;
   state.hasRec = false;
-  if (!state.isPlaying) startPlay();
-  toast("RECORDING");
+  recStart = performance.now();
+  toast("BOUNCING " + REC_BARS + " BARS");
   touch("rec");
   touch("footer");
+
+  const sr = 44100;
+  const spb = 60 / (state.bpm * 4);
+  const steps = 16 * REC_BARS;
+  const dur = Math.min(120, steps * spb + 2.2);
+  const oac = new Ctor(1, Math.ceil(dur * sr), sr);
+  const out = oac.createGain();
+  out.gain.value = gainFromVolume();
+  out.connect(oac.destination);
+
+  for (let i = 0; i < steps; i++) {
+    const when = 0.05 + i * spb;
+    const s16 = i % 16;
+    for (let t = 0; t < 4; t++) {
+      const tr = state.tracks[t];
+      if (tr.muted || !tr.trigs[s16]) continue;
+      voicesInto(oac, out, t, s16, when);
+    }
+  }
+
+  const done = buf => {
+    recBuffer = buf.getChannelData(0);           /* copies on first access */
+    recLen = recBuffer.length;
+    recBusy = false;
+    state.isRecordingWav = false;
+    state.hasRec = recLen > 0;
+    toast("CAPTURED " + fmtTime(recLen / sr));
+    touch("rec");
+    touch("footer");
+  };
+  oac.startRendering().then(done).catch(() => {
+    recBusy = false;
+    state.isRecordingWav = false;
+    toast("RENDER FAILED");
+    touch("rec");
+    touch("footer");
+  });
 }
 
-function stopRec(auto) {
-  if (!state.isRecordingWav) return;
+function stopRec() {                       /* cancel a running bounce */
+  if (!recBusy) return;
+  recBusy = false;
   state.isRecordingWav = false;
-  state.hasRec = recLen > 0;
-  if (auto) stopPlay();
-  toast(state.hasRec ? "CAPTURED " + fmtTime(recLen / actx.sampleRate) : "NOTHING RECORDED");
+  toast("BOUNCE CANCELLED");
   touch("rec");
   touch("footer");
 }
 
 function encodeWav() {
-  const sr = actx ? actx.sampleRate : 44100;
+  const sr = 44100;
   const n = recLen;
+  const d = recBuffer;
   const view = new DataView(new ArrayBuffer(44 + n * 2));
   const str = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
   str(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); str(8, "WAVE");
@@ -2190,13 +2401,10 @@ function encodeWav() {
   view.setUint16(32, 2, true); view.setUint16(34, 16, true);
   str(36, "data"); view.setUint32(40, n * 2, true);
   let off = 44;
-  for (let b = 0; b < recBufs.length; b++) {
-    const ch = recBufs[b];
-    for (let i = 0; i < ch.length && off < 44 + n * 2; i++) {
-      const s = ch[i] < -1 ? -1 : (ch[i] > 1 ? 1 : ch[i]);
-      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-      off += 2;
-    }
+  for (let i = 0; i < n; i++) {
+    const v = d[i] < -1 ? -1 : (d[i] > 1 ? 1 : d[i]);
+    view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    off += 2;
   }
   return new Blob([view], { type: "audio/wav" });
 }
@@ -2226,6 +2434,12 @@ ATLAS.bg = buildAtlas(BG);
 ATLAS_S.fg = buildAtlasS(FG);
 ATLAS_S.bg = buildAtlasS(BG);
 octx.imageSmoothingEnabled = false;
+
+const fileIn = document.getElementById("filein");
+if (fileIn) fileIn.addEventListener("change", e => {
+  const f = e.target.files && e.target.files[0];
+  if (f) readProjectFile(f);
+});
 
 buildHits();
 resize();
