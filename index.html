@@ -25,16 +25,22 @@
 /* ============================================================================
    ELEKTRON DIGITONE — CANVAS FRONT PANEL
    ----------------------------------------------------------------------------
-   RENDERING ARCHITECTURE
-   · One <canvas> (1000 x 750 design units) sized in CSS + capped devicePixelRatio.
-   · Every static pixel (casing, print, button faces, knob bodies) is rasterised
-     ONCE into an offscreen canvas. A "frame" is therefore: 1 blit + only the
-     live widgets (OLED, encoder rings, LEDs, status text).
-   · Dirty-flag loop: a frame is requested only by invalidate(). Nothing moving,
-     sequencer stopped, not recording  =>  no rAF callbacks, 0% graphics CPU.
-   · The OLED is a 180x100 buffer painted with a hand-built 5x7 bitmap font and
-     up-scaled with image smoothing OFF (crisp hardware pixels, and it is only
-     repainted when its content really changed).
+   RENDERING ARCHITECTURE (tuned for iPad 5 / A9)
+   1. STATIC LAYER — casing, print, button faces, encoder bodies are rasterised
+      once into an offscreen canvas.
+   2. REGION LAYER  — the panel is split into 57 dirty regions (screen, each
+      encoder, each pad, status plate…). Touching a knob repaints ONLY its own
+      region + the screen + the status plate: one small blit each instead of a
+      2000x1500 full-canvas repaint. No text/geometry outside a region is ever
+      re-submitted to the GPU.
+   3. DIRTY FLAG    — "needsRedraw" gates the whole loop; with nothing moving,
+      the sequencer stopped and REC off the loop schedules nothing at all (0%).
+   4. OLED SCREEN   — a 128x64 buffer (exactly like the hardware display) drawn
+      with a pre-baked bitmap-font atlas, one drawImage per glyph instead of
+      ~15 fillRects, then up-scaled 3x with smoothing OFF.
+   5. INPUT         — touchmove only records the finger position; values are
+      applied once per animation frame (coalesced), so a 120 Hz digitiser can
+      never queue more work than the renderer can draw.
    ========================================================================== */
 
 /* ---------------------------------------------------------------- 1. STATE */
@@ -45,77 +51,88 @@ const pct   = v => String(Math.round(v / MAXV * 100));
 const bip   = v => (v > 64 ? "+" : "") + (v - 64);
 const ratio = v => (0.25 + v / MAXV * 7.75).toFixed(2);
 const hz    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8)));
-const en    = (...n) => v => n[Math.min(n.length - 1, Math.round(v / MAXV * (n.length - 1)))];
+const ratioS = v => (0.25 + v / MAXV * 7.75).toFixed(1);
+const hzS    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8) / 1000));
+const en = (...n) => v => n[Math.min(n.length - 1, Math.round(v / MAXV * (n.length - 1)))];
 
 const PAGES = ["SYN1", "SYN2", "FLTR", "AMP", "LFO"];
 
-/* [key, OLED label, value formatter] + defaults, eight per page = encoders A-H */
+/* eight parameters per page — encoders A..H, in hardware order.
+   f = value shown under the encoder / in the status plate
+   s = compact 3-character value shown on the OLED                            */
 const PAGE_DEFS = {
-  SYN1: {
-    params: [
-      ["harm",     "HARM",   bip],
-      ["detune",   "DETUNE", bip],
-      ["feedback", "FEEDBK", pct],
-      ["mix",      "MIX",    pct],
-      ["ratioA",   "RAT A",  ratio],
-      ["ratioB",   "RAT B",  ratio],
-      ["ratioC",   "RAT C",  ratio],
-      ["level",    "LEVEL",  pct]
-    ],
-    def: { harm: 64, detune: 64, feedback: 42, mix: 96, ratioA: 40, ratioB: 72, ratioC: 24, level: 104 }
-  },
-  SYN2: {
-    params: [
-      ["amtA",   "A AMT",  pct],
-      ["amtB",   "B AMT",  pct],
-      ["drift",  "DRIFT",  bip],
-      ["phase",  "PHASE",  pct],
-      ["mod",    "MOD",    bip],
-      ["modf",   "MODF",   pct],
-      ["mix2",   "MIX 2",  pct],
-      ["spread", "SPREAD", pct]
-    ],
-    def: { amtA: 64, amtB: 64, drift: 64, phase: 0, mod: 72, modf: 56, mix2: 70, spread: 40 }
-  },
-  FLTR: {
-    params: [
-      ["cutoff",    "CUTOFF", hz],
-      ["resonance", "RESO",   pct],
-      ["type",      "TYPE",   en("LP4", "LP2", "HP2", "BP2", "NOTCH")],
-      ["env",       "ENV",    bip],
-      ["keytrk",    "KEYTRK", bip],
-      ["drive",     "DRIVE",  pct],
-      ["attack",    "ATK",    pct],
-      ["decay",     "DEC",    pct]
-    ],
-    def: { cutoff: 96, resonance: 44, type: 0, env: 20, keytrk: 64, drive: 30, attack: 12, decay: 62 }
-  },
-  AMP: {
-    params: [
-      ["attack",    "ATTACK",  pct],
-      ["decay",     "DECAY",   pct],
-      ["sustain",   "SUSTAIN", pct],
-      ["release",   "RELEASE", pct],
-      ["volume",    "VOLUME",  pct],
-      ["overdrive", "OVDRV",   pct],
-      ["pan",       "PAN",     bip],
-      ["reverb",    "REVERB",  pct]
-    ],
-    def: { attack: 6, decay: 48, sustain: 96, release: 38, volume: 104, overdrive: 18, pan: 64, reverb: 36 }
-  },
-  LFO: {
-    params: [
-      ["speed", "SPEED", pct],
-      ["shape", "SHAPE", en("SINE", "TRI", "SQR", "SAW", "RND", "EXP")],
-      ["fade",  "FADE",  pct],
-      ["phase", "PHASE", pct],
-      ["depth", "DEPTH", pct],
-      ["dest",  "DEST",  en("PITCH", "CUTOFF", "AMP", "PAN")],
-      ["mult",  "MULT",  en("1X", "2X", "4X", "8X", "1/2", "1/4")],
-      ["trig",  "TRIG",  en("FREE", "TRIG", "HOLD", "ONE")]
-    ],
-    def: { speed: 62, shape: 0, fade: 0, phase: 0, depth: 52, dest: 1, mult: 0, trig: 0 }
-  }
+  SYN1: [
+    { k: "harm",     l: "HARM",   f: bip,   s: bip },
+    { k: "detune",   l: "DETUNE", f: bip,   s: bip },
+    { k: "feedback", l: "FEEDBK",  f: pct,   s: pct },
+    { k: "mix",      l: "MIX",    f: pct,   s: pct },
+    { k: "ratioC",   l: "RAT C",  f: ratio, s: ratioS },
+    { k: "ratioA",   l: "RAT A",  f: ratio, s: ratioS },
+    { k: "ratioB",   l: "RAT B",  f: ratio, s: ratioS },
+    { k: "level",    l: "LEVEL",  f: pct,   s: pct }
+  ],
+  SYN2: [
+    { k: "mod",    l: "MOD",    f: bip, s: bip },
+    { k: "modf",   l: "MODF",   f: pct, s: pct },
+    { k: "atrk",   l: "ATRK",   f: pct, s: pct },
+    { k: "btrk",   l: "BTRK",   f: pct, s: pct },
+    { k: "phase",  l: "PHASE",  f: pct, s: pct },
+    { k: "drift",  l: "DRIFT",  f: bip, s: bip },
+    { k: "spread", l: "SPREAD", f: pct, s: pct },
+    { k: "level",  l: "LEVEL",  f: pct, s: pct }
+  ],
+  FLTR: [
+    { k: "freq",      l: "FREQ",   f: hz,  s: hzS },
+    { k: "resonance", l: "RESO",   f: pct, s: pct },
+    { k: "type",      l: "TYPE",   f: en("LP4", "LP2", "HP2", "BP2", "NOT"), s: en("LP4", "LP2", "HP2", "BP2", "NOT") },
+    { k: "env",       l: "ENV",    f: bip, s: bip },
+    { k: "key",       l: "KEYTRK", f: bip, s: bip },
+    { k: "drive",     l: "DRIVE",  f: pct, s: pct },
+    { k: "pan",       l: "PAN",    f: bip, s: bip },
+    { k: "level",     l: "LEVEL",  f: pct, s: pct }
+  ],
+  AMP: [
+    { k: "attack",    l: "ATTACK",  f: pct, s: pct },
+    { k: "decay",     l: "DECAY",   f: pct, s: pct },
+    { k: "sustain",   l: "SUSTAIN", f: pct, s: pct },
+    { k: "release",   l: "RELEASE", f: pct, s: pct },
+    { k: "volume",    l: "VOLUME",  f: pct, s: pct },
+    { k: "overdrive", l: "OVDRV",   f: pct, s: pct },
+    { k: "pan",       l: "PAN",     f: bip, s: bip },
+    { k: "level",     l: "LEVEL",   f: pct, s: pct }
+  ],
+  LFO: [
+    { k: "speed", l: "SPEED", f: pct, s: pct },
+    { k: "shape", l: "SHAPE", f: en("SINE", "TRI", "SQR", "SAW", "RND", "EXP"), s: en("SIN", "TRI", "SQR", "SAW", "RND", "EXP") },
+    { k: "fade",  l: "FADE",  f: pct, s: pct },
+    { k: "phase", l: "PHASE", f: pct, s: pct },
+    { k: "depth", l: "DEPTH", f: pct, s: pct },
+    { k: "dest",  l: "DEST",  f: en("PITCH", "CUTOFF", "AMP", "PAN"), s: en("PIT", "CUT", "AMP", "PAN") },
+    { k: "mult",  l: "MULT",  f: en("1X", "2X", "4X", "8X", "1/2", "1/4"), s: en("1X", "2X", "4X", "8X", "1/2", "1/4") },
+    { k: "trig",  l: "TRIG",  f: en("FREE", "TRIG", "HOLD", "ONE"), s: en("FRE", "TRG", "HLD", "ONE") }
+  ]
+};
+
+const PAGE_DEFAULTS = {
+  SYN1: { harm: 64, detune: 64, feedback: 42, mix: 96, ratioC: 24, ratioA: 40, ratioB: 72, level: 104 },
+  SYN2: { mod: 72, modf: 56, atrk: 64, btrk: 64, phase: 0, drift: 64, spread: 40, level: 104 },
+  FLTR: { freq: 96, resonance: 44, type: 0, env: 20, key: 64, drive: 30, pan: 64, level: 104 },
+  AMP:  { attack: 6, decay: 48, sustain: 96, release: 38, volume: 104, overdrive: 18, pan: 64, level: 104 },
+  LFO:  { speed: 62, shape: 0, fade: 0, phase: 0, depth: 52, dest: 1, mult: 0, trig: 0 }
+};
+
+/* OLED page layouts — mirrors the hardware screen structure */
+const SCREEN_SPEC = {
+  SYN1: { tab: "SYN", num: "1", big: "1", cap: "ALGO", group: "RATIO",   boxLbl: ["C", "A", "B"],
+          thumbs: [["HRM", "wave"], ["DTN", "bars"], ["FBK", "diamond"], ["MIX", "xy"]] },
+  SYN2: { tab: "SYN", num: "2", big: "2", cap: "ALGO", group: "MOD",     boxLbl: ["PHS", "DRF", "SPR"],
+          thumbs: [["MOD", "wave"], ["MDF", "bars"], ["ATR", "diamond"], ["BTR", "xy"]] },
+  FLTR: { tab: "FLT", num: "1", big: "1", cap: "TYPE", group: "FILTER",  boxLbl: ["KEY", "DRV", "PAN"],
+          thumbs: [["FRQ", "curve"], ["RES", "bars"], ["TYP", "diamond"], ["ENV", "xy"]] },
+  AMP:  { tab: "AMP", num: "1", big: "1", cap: "ENV",  group: "ENVELOPE", boxLbl: ["VOL", "OVR", "PAN"],
+          thumbs: [["ATK", "env"], ["DEC", "bars"], ["SUS", "bars"], ["REL", "xy"]] },
+  LFO:  { tab: "LFO", num: "1", big: "1", cap: "SHP",  group: "LFO",      boxLbl: ["DEP", "DST", "MUL"],
+          thumbs: [["SPD", "wave"], ["SHP", "bars"], ["FAD", "diamond"], ["PHS", "xy"]] }
 };
 
 const TRACK_RGB  = ["224,66,54", "228,176,60", "62,160,74", "150,74,206"];
@@ -145,7 +162,7 @@ function makeTracks() {
   state.tracks = [];
   for (let t = 0; t < 4; t++) {
     const params = {};
-    for (const p of PAGES) params[p] = Object.assign({}, PAGE_DEFS[p].def);
+    for (const p of PAGES) params[p] = Object.assign({}, PAGE_DEFAULTS[p]);
     const trigs = new Array(16).fill(0);
     for (const s of DEMO_TRIGS[t]) trigs[s] = 1;
     state.tracks.push({ trigs: trigs, params: params, octave: t * 5 });
@@ -158,8 +175,8 @@ makeTracks();
 const W = 1000, H = 750;
 
 const G = {
-  screen:   { x: 116, y: 84, w: 360, h: 200 },
-  bezel:    { x: 108, y: 76, w: 376, h: 216 },
+  screen: { x: 112, y: 86, w: 384, h: 192 },      /* 128x64 hardware pixels at 3x */
+  plate:  { x: 100, y: 64, w: 410, h: 252 },
   enc: [
     { id: "A", x: 566, y: 142 }, { id: "B", x: 673, y: 142 },
     { id: "C", x: 780, y: 142 }, { id: "D", x: 887, y: 142 },
@@ -211,6 +228,16 @@ const TRACKBTN = [
 ];
 
 const UI = '-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif';
+const F = {
+  btn:   "600 10px " + UI,
+  btnLg: "700 12px " + UI,
+  small: "600 9px " + UI,
+  tiny:  "500 8px " + UI,
+  num:   "700 17px " + UI,
+  track: "700 18px " + UI,
+  foot:  "700 17px " + UI,
+  bpm:   "700 26px " + UI
+};
 
 /* ------------------------------------------------------------- 3. HELPERS */
 
@@ -239,16 +266,83 @@ let needsRedraw = true;
 let oledDirty = true;
 let rafId = 0;
 
+/* --- dirty regions ------------------------------------------------------- */
+const REGIONS = new Map();
+const dirty = new Set();
+
+function addRegion(name, x, y, w, h, draw) {
+  REGIONS.set(name, { name: name, x: x, y: y, w: w, h: h, draw: draw });
+}
+function touch(name) {
+  needsRedraw = true;
+  dirty.add(name);
+  invalidate();
+}
+function touchAll() {
+  needsRedraw = true;
+  REGIONS.forEach(r => dirty.add(r.name));
+  invalidate();
+}
 function invalidate() {
   needsRedraw = true;
   if (!rafId) rafId = requestAnimationFrame(frame);
 }
 
+function blitRegion(r) {
+  const x = Math.max(0, Math.floor(r.x * dpr));
+  const y = Math.max(0, Math.floor(r.y * dpr));
+  const w = Math.min(bg.width - x, Math.ceil(r.w * dpr) + 1);
+  const h = Math.min(bg.height - y, Math.ceil(r.h * dpr) + 1);
+  if (w > 0 && h > 0) ctx.drawImage(bg, x, y, w, h, x, y, w, h);
+}
+
+function paintDirty() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  for (const name of dirty) {
+    const r = REGIONS.get(name);
+    if (r) blitRegion(r);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  for (const name of dirty) {
+    const r = REGIONS.get(name);
+    if (!r) continue;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(r.x, r.y, r.w, r.h);
+    ctx.clip();
+    r.draw();
+    ctx.restore();
+  }
+  dirty.clear();
+}
+
+/* full repaint — first frame, resize, orientation change */
+function drawUI() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(bg, 0, 0);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  REGIONS.forEach(r => {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(r.x, r.y, r.w, r.h);
+    ctx.clip();
+    r.draw();
+    ctx.restore();
+  });
+  dirty.clear();
+  needsRedraw = false;
+}
+
 function frame() {
   rafId = 0;
   if (state.isPlaying) consumeScheduledSteps();
-  if (state.isRecordingWav) needsRedraw = true;         /* REC lamp breathing */
-  if (needsRedraw) { drawUI(); needsRedraw = false; }
+  applyDrags();
+  if (state.isRecordingWav) {
+    touch("rec");
+    const t = recTime();
+    if (t !== frame.lastRec) { frame.lastRec = t; touch("footer"); }
+  }
+  if (dirty.size) { paintDirty(); needsRedraw = false; }
   if (state.isPlaying || state.isRecordingWav) rafId = requestAnimationFrame(frame);
 }
 
@@ -256,13 +350,14 @@ function resize() {
   const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.995;
   canvas.style.width = (W * s) + "px";
   canvas.style.height = (H * s) + "px";
-  const d = Math.min(window.devicePixelRatio || 1, 2);  /* cap: A9 fill-rate */
+  const d = Math.min(window.devicePixelRatio || 1, 2);     /* cap: A9 fill-rate */
   if (d !== dpr || bg.width !== Math.round(W * d)) {
     dpr = d;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     buildStatic();
   }
+  drawUI();
   invalidate();
 }
 window.addEventListener("resize", resize, { passive: true });
@@ -280,7 +375,6 @@ function buildStatic() {
   c.setTransform(dpr, 0, 0, dpr, 0, 0);
   c.clearRect(0, 0, W, H);
 
-  /* backdrop */
   c.fillStyle = "#0b0b0d";
   c.fillRect(0, 0, W, H);
 
@@ -301,7 +395,6 @@ function buildStatic() {
   c.lineWidth = 2;
   c.stroke();
 
-  /* brushed-metal streaks (static: zero runtime cost) */
   seed = 1337;
   for (let i = 0; i < 54; i++) {
     const y = 14 + (rnd() % (H - 28));
@@ -366,37 +459,44 @@ function buildStatic() {
   c.fillStyle = "#82828c";
   c.fillText("W A V   R E C O R D E R", rp.x + 12, rp.y + 13);
 
-  /* screen bezel + well */
-  const bz = G.bezel, s = G.screen;
-  rr(c, bz.x - 2, bz.y - 2, bz.w + 4, bz.h + 4, 9);
+  /* screen plate — the "Digitone" name lives inside it, like the hardware */
+  const pl = G.plate, s = G.screen;
+  rr(c, pl.x - 2, pl.y - 2, pl.w + 4, pl.h + 4, 11);
   c.fillStyle = "#08080a";
   c.fill();
-  const bez = c.createLinearGradient(0, bz.y, 0, bz.y + bz.h);
-  bez.addColorStop(0, "#131315");
-  bez.addColorStop(1, "#0b0b0d");
-  rr(c, bz.x, bz.y, bz.w, bz.h, 6);
-  c.fillStyle = bez;
+  const pg = c.createLinearGradient(0, pl.y, 0, pl.y + pl.h);
+  pg.addColorStop(0, "#161618");
+  pg.addColorStop(0.55, "#111113");
+  pg.addColorStop(1, "#0c0c0e");
+  rr(c, pl.x, pl.y, pl.w, pl.h, 8);
+  c.fillStyle = pg;
   c.fill();
-  c.strokeStyle = "rgba(255,255,255,.05)";
+  c.strokeStyle = "rgba(255,255,255,.06)";
   c.lineWidth = 1;
   c.stroke();
-  c.fillStyle = "#0a0b00";
-  c.fillRect(s.x, s.y, s.w, s.h);
-  c.strokeStyle = "rgba(255,204,0,.10)";
-  c.strokeRect(s.x - 0.5, s.y - 0.5, s.w + 1, s.h + 1);
 
   c.textAlign = "left";
-  c.fillStyle = "#a8a8b2";
+  c.textBaseline = "middle";
+  c.fillStyle = "#b9b9c2";
   c.font = "500 9.5px " + UI;
-  c.fillText("Polyphonic Digital Synthesizer", 116, 68);
+  c.fillText("Polyphonic Digital Synthesizer", s.x + 4, pl.y + 13);
 
-  /* product name */
   c.textBaseline = "alphabetic";
   c.fillStyle = "#f2f2f5";
-  c.font = "700 33px " + UI;
-  c.fillText("Digitone", 116, 322);
+  c.font = "700 30px " + UI;
+  c.fillText("Digitone", pl.x + 24, pl.y + pl.h - 16);
 
-  /* encoder bodies + letters, big knobs + captions */
+  /* OLED well */
+  c.fillStyle = "#0a0b00";
+  c.fillRect(s.x, s.y, s.w, s.h);
+  c.strokeStyle = "rgba(0,0,0,.9)";
+  c.lineWidth = 2;
+  c.strokeRect(s.x - 1, s.y - 1, s.w + 2, s.h + 2);
+  c.strokeStyle = "rgba(255,204,0,.09)";
+  c.lineWidth = 1;
+  c.strokeRect(s.x - 3.5, s.y - 3.5, s.w + 7, s.h + 7);
+
+  /* encoder bodies + letters, knobs + captions */
   c.textAlign = "center";
   c.textBaseline = "middle";
   for (const e of G.enc) {
@@ -417,12 +517,11 @@ function buildStatic() {
     }
   }
 
-  /* button faces */
   for (const b of BTNS) buttonFace(c, b);
   for (const t of TRIGS) trigFace(c, t);
   for (const t of TRACKBTN) trackFace(c, t);
 
-  /* footer plate */
+  /* status plate */
   const f = G.footer;
   rr(c, f.x, f.y, f.w, f.h, 12);
   c.fillStyle = "#141416";
@@ -455,7 +554,6 @@ function encoderBody(c, x, y, r) {
 
   c.beginPath(); c.arc(x, y, r * 0.74, 0, 6.2832);
   c.strokeStyle = "rgba(0,0,0,.28)"; c.lineWidth = 1; c.stroke();
-
   c.beginPath(); c.arc(x, y, r - 1.5, Math.PI * 1.12, Math.PI * 1.72);
   c.strokeStyle = "rgba(255,255,255,.15)"; c.lineWidth = 1.6; c.stroke();
   c.beginPath(); c.arc(x, y, r - 1.5, Math.PI * 0.12, Math.PI * 0.45);
@@ -507,16 +605,17 @@ function trackFace(c, t) {
   c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
 }
 
-/* ======================================================== OLED (180x100) */
+/* ============================================== OLED — 128 x 64, like the HW */
 
-const OW = 180, OH = 100;
+const SW = 128, SH = 64;
 const oled = document.createElement("canvas");
-oled.width = OW; oled.height = OH;
+oled.width = SW;
+oled.height = SH;
 const octx = oled.getContext("2d");
 
 const FG = "#ffcc00", BG = "#0a0b00";
 
-/* hand-built 5x7 bitmap font ---------------------------------------------- */
+/* 5x7 bitmap font */
 const GL = {
   " ": [0, 0, 0, 0, 0, 0, 0],
   "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
@@ -548,218 +647,279 @@ const GL = {
   "|": [4, 4, 4, 4, 4, 4, 4],        ",": [0, 0, 0, 0, 12, 4, 8]
 };
 
-function pxText(x, y, s, col) {
-  octx.fillStyle = col;
-  for (let i = 0; i < s.length; i++) {
-    const g = GL[s[i]];
-    if (!g) continue;
-    const bx = x + i * 6;
+const GLYPH_ORDER = Object.keys(GL);
+const GIDX = {};
+GLYPH_ORDER.forEach((ch, i) => { GIDX[ch] = i; });
+
+/* one pre-baked atlas per colour: glyph blits instead of ~15 fillRects each */
+function buildAtlas(color) {
+  const cv = document.createElement("canvas");
+  cv.width = GLYPH_ORDER.length * 6;
+  cv.height = 7;
+  const c = cv.getContext("2d");
+  c.fillStyle = color;
+  for (let i = 0; i < GLYPH_ORDER.length; i++) {
+    const g = GL[GLYPH_ORDER[i]];
     for (let r = 0; r < 7; r++) {
       const bits = g[r];
       if (!bits) continue;
-      for (let b = 0; b < 5; b++) if (bits & (16 >> b)) octx.fillRect(bx + b, y + r, 1, 1);
+      for (let b = 0; b < 5; b++) if (bits & (16 >> b)) c.fillRect(i * 6 + b, r, 1, 1);
     }
   }
+  return cv;
 }
-const pxW = s => s.length * 6 - 1;
-const pxTextR = (xr, y, s, col) => pxText(xr - pxW(s), y, s, col);
-const pxHLine = (x, y, w, col) => { octx.fillStyle = col; octx.fillRect(x, y, w, 1); };
-const pxVLine = (x, y, h, col) => { octx.fillStyle = col; octx.fillRect(x, y, 1, h); };
-function pxBox(x, y, w, h, col) {
-  pxHLine(x, y, w, col); pxHLine(x, y + h - 1, w, col);
-  pxVLine(x, y, h, col); pxVLine(x + w - 1, y, h, col);
-}
-function pxArrowDown(x, y) {
-  octx.fillStyle = FG;
-  octx.fillRect(x, y - 2, 1, 2);
-  octx.fillRect(x - 2, y, 5, 1);
-  octx.fillRect(x - 1, y - 1, 3, 1);
-}
-function pxArrowRight(x, y) {
-  octx.fillStyle = FG;
-  octx.fillRect(x - 2, y, 2, 1);
-  octx.fillRect(x - 1, y - 1, 1, 3);
-  octx.fillRect(x - 2, y - 1, 1, 3);
-}
+const ATLAS = { fg: null, bg: null };
 
-/* ------------------------------------------------------- OLED composition */
+function pxText(x, y, s, col, scale) {
+  const a = ATLAS[col === "bg" ? "bg" : "fg"];
+  const k = scale || 1;
+  for (let i = 0; i < s.length; i++) {
+    const id = GIDX[s[i]];
+    if (id === undefined) continue;
+    octx.drawImage(a, id * 6, 0, 5, 7, x + i * 6 * k, y, 5 * k, 7 * k);
+  }
+}
+const textW = (s, k) => s.length * 6 * (k || 1) - (k || 1);
+
+/* small drawing helpers on the OLED */
+function fillBox(x, y, w, h) { octx.fillStyle = FG; octx.fillRect(x, y, w, h); }
+function box(x, y, w, h) {
+  octx.fillStyle = FG;
+  octx.fillRect(x, y, w, 1);
+  octx.fillRect(x, y + h - 1, w, 1);
+  octx.fillRect(x, y, 1, h);
+  octx.fillRect(x + w - 1, y, 1, h);
+}
+function dashBox(x, y, w, h) {
+  octx.fillStyle = FG;
+  for (let i = 0; i < w; i += 2) { octx.fillRect(x + i, y, 1, 1); octx.fillRect(x + i, y + h - 1, 1, 1); }
+  for (let j = 0; j < h; j += 2) { octx.fillRect(x, y + j, 1, 1); octx.fillRect(x + w - 1, y + j, 1, 1); }
+}
+function vLine(x, y0, y1) { octx.fillStyle = FG; octx.fillRect(x, y0, 1, y1 - y0 + 1); }
+function hLine(x0, x1, y) { octx.fillStyle = FG; octx.fillRect(x0, y, x1 - x0 + 1, 1); }
+function dottedV(x, y0, y1) { octx.fillStyle = FG; for (let y = y0; y <= y1; y += 2) octx.fillRect(x, y, 1, 1); }
+
+/* ----------------------------------------------------------- screen render */
 
 function renderOLED() {
   const c = octx;
+  c.fillStyle = BG;
+  c.fillRect(0, 0, SW, SH);
+
   const tr = state.tracks[state.currentTrack];
   const page = state.currentPage;
-  const def = PAGE_DEFS[page];
+  const defs = PAGE_DEFS[page];
+  const spec = SCREEN_SPEC[page];
   const pv = tr.params[page];
+  const v = i => pv[defs[i].k];
+  const sel = state.selParam;
 
-  c.fillStyle = BG;
-  c.fillRect(0, 0, OW, OH);
+  /* ---- header: bank/pattern · name · tempo ----------------------------- */
+  fillBox(1, 1, 22, 10);
+  pxText(3, 2, state.bank + state.patternNo, "bg");
 
-  /* --- top bar: bank/pattern · name · tempo */
-  c.fillStyle = FG; c.fillRect(2, 2, 20, 9);
-  pxText(4, 3, state.bank + state.patternNo, BG);
-  pxBox(24, 2, 70, 9, FG);
-  pxText(27, 3, state.patternName, FG);
-  pxTextR(177, 3, state.bpm.toFixed(1), FG);
-  pxHLine(2, 13, 176, FG);
+  const tempo = state.bpm.toFixed(1);
+  const tw = textW(tempo);
+  const tx = 126 - tw;
+  const nameMax = Math.max(0, Math.floor((tx - 32 + 1) / 6));
+  pxText(23, 2, state.patternName.slice(0, nameMax), "fg");
 
-  /* --- page · algorithm · track */
-  c.fillStyle = FG; c.fillRect(2, 15, 27, 9);
-  pxText(4, 16, page, BG);
-  pxText(34, 16, "ALG 1", FG);
-  pxTextR(177, 16, "TRK " + (state.currentTrack + 1), FG);
-
-  /* --- eight parameters, four columns x two rows */
-  const cols = [2, 47, 92, 137];
-  for (let i = 0; i < 8; i++) {
-    const col = cols[i % 4];
-    const ny = i < 4 ? 28 : 48;
-    const key = def.params[i][0];
-    const sel = state.selParam === i;
-    const fg = sel ? BG : FG;
-
-    if (sel) { c.fillStyle = FG; c.fillRect(col - 1, ny - 2, 43, 20); }
-    pxText(col, ny, def.params[i][1], fg);
-    pxText(col, ny + 9, def.params[i][2](pv[key]), fg);
-    c.fillStyle = fg;
-    const bw = Math.round(clamp(pv[key] / MAXV, 0, 1) * 38);
-    if (bw > 0) c.fillRect(col, ny + 18, bw, 2);
+  fillBox(tx - 9, 1, tw + 10, 10);
+  /* transport glyph + tempo, both knocked out of the filled box */
+  octx.fillStyle = BG;
+  if (state.isPlaying) {
+    for (let i = 0; i < 5; i++) octx.fillRect(tx - 8, 3 + i, 1, 7 - i * 2);
+    for (let i = 0; i < 4; i++) octx.fillRect(tx - 7 + i, 3 + i, 1, 7 - i * 2);
+  } else {
+    octx.fillRect(tx - 8, 3, 5, 6);
   }
-  pxHLine(2, 70, 176, FG);
+  pxText(tx, 2, tempo, "bg");
 
-  /* --- FM algorithm 1 block scheme */
-  const ax = 2, ay = 72;
-  const blocks = [["A", ax], ["B", ax + 22], ["C", ax + 44]];
-  for (const [lbl, bx] of blocks) {
-    pxBox(bx, ay, 12, 9, FG);
-    pxText(bx + 4, ay + 1, lbl, FG);
-  }
-  c.fillStyle = FG;
-  c.fillRect(ax + 13, ay + 4, 8, 1); pxArrowRight(ax + 21, ay + 4);
-  c.fillRect(ax + 35, ay + 4, 8, 1); pxArrowRight(ax + 43, ay + 4);
-  c.fillRect(ax + 50, ay + 10, 1, 3); pxArrowDown(ax + 50, ay + 14);
-  pxText(ax, 84, "ALG 1", FG);
-  pxText(ax + 62, 84, "OUT", FG);
+  /* ---- page tab -------------------------------------------------------- */
+  box(1, 14, 22, 24);
+  pxText(2, 15, spec.tab, "fg");
+  pxText(7, 22, spec.num, "fg", 2);          /* large page number */
 
-  /* --- page-dependent graphic */
-  drawOLEDGraphic(84, 74, 94, 14);
+  /* ---- level meter ----------------------------------------------------- */
+  const lvl = Math.max(0.06, v(7) / MAXV);
+  dashBox(1, 41, 22, 13);
+  octx.fillStyle = FG;
+  octx.fillRect(3, 45, Math.round(18 * lvl), 4);
+  octx.fillRect(3, 45, 1, 4);
+  for (let i = 3; i <= 21; i += 4) octx.fillRect(i, 50, 1, 1);
+  pxText(4, 55, defs[7].l.replace("LEVEL", "LEV").slice(0, 3), "fg");
 
-  /* --- 16 step strip */
-  pxHLine(2, 91, 176, FG);
-  for (let i = 0; i < 16; i++) {
-    const x = 3 + i * 7;
-    if (tr.trigs[i]) { c.fillStyle = FG; c.fillRect(x, 93, 6, 5); }
-    else pxBox(x, 93, 6, 5, FG);
-    if (state.isPlaying && state.currentStep === i) {
-      c.fillStyle = FG;
-      c.fillRect(x - 1, 92, 8, 1);
-      c.fillRect(x - 1, 98, 8, 1);
+  /* ---- centre graphic -------------------------------------------------- */
+  drawScreenGraphic(page, pv);
+
+  /* ---- big value box + caption ---------------------------------------- */
+  box(48, 14, 17, 17);
+  pxText(52, 16, spec.big, "fg", 2);
+  pxText(48, 32, spec.cap, "fg");
+
+  /* ---- three value boxes ---------------------------------------------- */
+  const boxX = [65, 86, 107];
+  const boxW = 20;
+  for (let i = 0; i < 3; i++) {
+    const idx = 4 + i;
+    const x = boxX[i];
+    pxText(x + ((boxW - textW(spec.boxLbl[i])) >> 1), 11, spec.boxLbl[i], "fg");
+    if (sel === idx) {
+      fillBox(x, 19, boxW, 12);
+      pxText(x + 1, 21, defs[idx].s(v(idx)), "bg");
+    } else {
+      box(x, 19, boxW, 12);
+      pxText(x + 1, 21, defs[idx].s(v(idx)), "fg");
     }
   }
-  pxText(120, 93, "1/16", FG);
-  pxTextR(177, 93, state.isPlaying ? "PLAY" : "STOP", FG);
+  pxText(65 + ((62 - textW(spec.group)) >> 1), 32, spec.group, "fg");
+
+  /* ---- four thumbnails ------------------------------------------------- */
+  const thumbX = [44, 65, 86, 107];
+  for (let i = 0; i < 4; i++) {
+    const x = thumbX[i];
+    if (sel === i) fillBox(x, 39, 21, 14);
+    else box(x, 39, 21, 14);
+    drawThumb(spec.thumbs[i][1], x + 3, 41, 15, 10, v(i), sel === i);
+    pxText(x + ((21 - textW(spec.thumbs[i][0])) >> 1), 54, spec.thumbs[i][0], "fg");
+  }
 }
 
-function drawOLEDGraphic(x, y, w, h) {
-  const page = state.currentPage;
-  const p = state.tracks[state.currentTrack].params[page];
-  const mid = y + h / 2;
-  octx.strokeStyle = FG;
+/* mini graphics for the thumbnail row */
+function drawThumb(kind, x, y, w, h, val, inverted) {
+  const col = inverted ? BG : FG;
+  octx.fillStyle = col;
+  octx.strokeStyle = col;
   octx.lineWidth = 1;
-  octx.fillStyle = FG;
+  const t = val / MAXV;
 
-  if (page === "FLTR") {
-    /* log-frequency low-pass response with a resonance bump */
-    const fc = 0.08 + (p.cutoff / MAXV) * 0.86;
-    const res = p.resonance / MAXV;
-    const peak = 1 + res * 0.85;
+  if (kind === "wave") {
+    const cyc = 1 + Math.round(t * 2);
     octx.beginPath();
     for (let i = 0; i <= w; i++) {
-      const t = i / w;
-      const g = 1 / Math.sqrt(1 + Math.pow(t / fc, 8));
-      const bump = res * 0.9 * Math.exp(-Math.pow((t - fc) * 22, 2));
-      const v = Math.min(peak, g * (1 + bump));
-      const yy = y + 1 + (1 - v / peak) * (h - 2);
+      const yy = y + h / 2 - Math.sin((i / w) * Math.PI * 2 * cyc) * (h / 2 - 1);
       i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
     }
     octx.stroke();
-    octx.fillRect(x, y + h + 1, w + 1, 1);
+  } else if (kind === "bars") {
+    for (let i = 0; i < 3; i++) {
+      const yy = y + 2 + i * 3;
+      octx.fillRect(x, yy, w, 1);
+      octx.fillRect(x + Math.round((w - 3) * (0.2 + t * 0.8)), yy - 1, 3, 3);
+    }
+  } else if (kind === "diamond") {
+    const cx = x + w / 2, cy = y + h / 2, r = Math.min(w, h) / 2 - 1;
+    octx.beginPath();
+    octx.moveTo(cx, cy - r); octx.lineTo(cx + r, cy); octx.lineTo(cx, cy + r); octx.lineTo(cx - r, cy);
+    octx.closePath(); octx.stroke();
+    const r2 = Math.max(1, Math.round(r * t));
+    octx.beginPath();
+    octx.moveTo(cx, cy - r2); octx.lineTo(cx + r2, cy); octx.lineTo(cx, cy + r2); octx.lineTo(cx - r2, cy);
+    octx.closePath(); octx.fill();
+  } else if (kind === "xy") {
+    octx.fillRect(x, y + h / 2 - 1, w, 3);
+    octx.fillRect(x + Math.round((w - 6) * t), y + h / 2 - 2, 6, 5);
+    octx.fillStyle = inverted ? BG : FG;
+  } else if (kind === "curve") {
+    octx.beginPath();
+    for (let i = 0; i <= w; i++) {
+      const tt = i / w;
+      const g = 1 / Math.sqrt(1 + Math.pow(tt / 0.6, 6));
+      const yy = y + h - g * h;
+      i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+    }
+    octx.stroke();
+  } else if (kind === "env") {
+    octx.beginPath();
+    octx.moveTo(x, y + h);
+    octx.lineTo(x + w * 0.2, y + 1);
+    octx.lineTo(x + w * 0.45, y + h * 0.45);
+    octx.lineTo(x + w * 0.72, y + h * 0.45);
+    octx.lineTo(x + w, y + h);
+    octx.stroke();
+  }
+}
+
+/* the FM algorithm / filter / envelope / LFO drawing, hardware position */
+function drawScreenGraphic(page, pv) {
+  octx.fillStyle = FG;
+  octx.strokeStyle = FG;
+  octx.lineWidth = 1;
+
+  if (page === "SYN1" || page === "SYN2") {
+    /* A, B, C operator blocks with routing and X/Y mod destinations */
+    const b = (x, y, ch) => {
+      box(x, y, 9, 9);
+      pxText(x + 2, y + 1, ch, "fg");
+    };
+    b(35, 14, "B");
+    b(23, 26, "A");
+    b(35, 26, "B");
+    b(23, 38, "C");
+    vLine(39, 23, 25);                 /* B top -> B mid */
+    hLine(32, 34, 30);                 /* A -> B mid */
+    vLine(27, 35, 37);                 /* A -> C */
+    dottedV(27, 47, 52);
+    dottedV(39, 35, 52);
+    pxText(25, 54, "X", "fg");
+    pxText(37, 54, "Y", "fg");
+    return;
+  }
+
+  if (page === "FLTR") {
+    const fc = 0.1 + (pv.freq / MAXV) * 0.8;
+    const res = pv.resonance / MAXV;
+    octx.beginPath();
+    for (let i = 0; i <= 22; i++) {
+      const t = i / 22;
+      const g = 1 / Math.sqrt(1 + Math.pow(t / fc, 8));
+      const bump = res * 0.9 * Math.exp(-Math.pow((t - fc) * 22, 2));
+      const val = Math.min(1 + res * 0.85, g * (1 + bump));
+      const yy = 33 - (val / (1 + res * 0.85)) * 17;
+      i ? octx.lineTo(25 + i, yy) : octx.moveTo(25 + i, yy);
+    }
+    octx.stroke();
+    hLine(25, 47, 36);
     return;
   }
 
   if (page === "AMP") {
-    const a = 0.03 + (p.attack / MAXV) * 0.16;
-    const d = 0.10 + (p.decay / MAXV) * 0.22;
-    const s = p.sustain / MAXV;
-    const r = 0.12 + (p.release / MAXV) * 0.30;
+    const a = 0.03 + (pv.attack / MAXV) * 0.16;
+    const d = 0.10 + (pv.decay / MAXV) * 0.2;
+    const s = pv.sustain / MAXV;
+    const r = 0.12 + (pv.release / MAXV) * 0.3;
     const xs = [0, a, a + d, a + d + 0.22, a + d + 0.22 + r];
-    const ys = [y + h, y + 1, y + h - s * h, y + h - s * h, y + h];
+    const ys = [36, 14, 36 - s * 21, 36 - s * 21, 36];
     octx.beginPath();
     for (let i = 0; i < xs.length; i++) {
-      const px = x + (xs[i] / xs[xs.length - 1]) * w;
+      const px = 25 + (xs[i] / xs[4]) * 22;
       i ? octx.lineTo(px, ys[i]) : octx.moveTo(px, ys[i]);
     }
     octx.stroke();
+    hLine(25, 47, 36);
     return;
   }
 
-  if (page === "LFO") {
-    const shape = Math.round(p.shape / MAXV * 5);
-    const cyc = 1 + Math.round(p.speed / MAXV * 3);
-    octx.beginPath();
-    for (let i = 0; i <= w; i++) {
-      const t = i / w, ph = (t * cyc) % 1;
-      let v;
-      if (shape === 2) v = ph < 0.5 ? 1 : -1;
-      else if (shape === 3) v = 1 - 2 * ph;
-      else if (shape === 1) v = 1 - 4 * Math.abs(ph - 0.5);
-      else if (shape === 5) v = (ph < 0.5 ? 1 : -1) * (1 - ph);
-      else v = Math.sin(ph * Math.PI * 2);
-      const yy = mid - v * (h / 2 - 1);
-      i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
-    }
-    octx.stroke();
-    return;
-  }
-
-  /* SYN1 / SYN2 — carrier wave, cycle count follows the harmonic amount */
-  const cyc = 1 + Math.round(p.harm / MAXV * 3);
+  /* LFO */
+  const shape = Math.round(pv.shape / MAXV * 5);
+  const cyc = 1 + Math.round(pv.speed / MAXV * 2);
   octx.beginPath();
-  for (let i = 0; i <= w; i++) {
-    const v = Math.sin((i / w) * Math.PI * 2 * cyc);
-    const yy = mid - v * (h / 2 - 1);
-    i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+  for (let i = 0; i <= 22; i++) {
+    const ph = ((i / 22) * cyc) % 1;
+    let val;
+    if (shape === 2) val = ph < 0.5 ? 1 : -1;
+    else if (shape === 3) val = 1 - 2 * ph;
+    else if (shape === 1) val = 1 - 4 * Math.abs(ph - 0.5);
+    else if (shape === 3) val = 1 - 2 * ph;
+    else val = Math.sin(ph * Math.PI * 2);
+    const yy = 25 - val * 9;
+    i ? octx.lineTo(25 + i, yy) : octx.moveTo(25 + i, yy);
   }
   octx.stroke();
 }
 
-/* ============================================================ DYNAMIC UI */
+/* ======================================================== DYNAMIC WIDGETS */
 
-function drawUI() {
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.drawImage(bg, 0, 0);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-  drawScreen();
-  drawEncoders();
-  drawBigKnobs();
-  drawButtons();
-  drawTrigs();
-  drawTrackButtons();
-  drawPageLeds();
-  drawRecorder();
-  drawFooter();
-  drawPressed();
-}
-
-function drawScreen() {
-  if (oledDirty) { renderOLED(); oledDirty = false; }
-  const s = G.screen;
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(oled, s.x, s.y, s.w, s.h);
-  ctx.imageSmoothingEnabled = true;
-}
-
-/* --- encoders A..H ------------------------------------------------------- */
 const A0 = -Math.PI / 2 - Math.PI * 0.75;
 const SPAN = Math.PI * 1.5;
 
@@ -788,86 +948,110 @@ function ring(x, y, r, value, hot) {
   ctx.lineCap = "butt";
 }
 
-function drawEncoders() {
-  const page = state.currentPage;
-  const def = PAGE_DEFS[page];
-  const pv = state.tracks[state.currentTrack].params[page];
+function drawScreenRegion() {
+  if (oledDirty) { renderOLED(); oledDirty = false; }
+  const s = G.screen;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(oled, s.x, s.y, s.w, s.h);
+  ctx.imageSmoothingEnabled = true;
+}
 
+function drawEncoderRegion(i) {
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page][i];
+  const pv = state.tracks[state.currentTrack].params[page];
+  const e = G.enc[i];
+  const sel = state.selParam === i;
+  ring(e.x, e.y, 32, pv[def.k], sel);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  for (let i = 0; i < 8; i++) {
-    const e = G.enc[i];
-    const val = pv[def.params[i][0]];
-    const sel = state.selParam === i;
-    ring(e.x, e.y, 32, val, sel);
-    ctx.font = "600 9px " + UI;
-    ctx.fillStyle = sel ? "#ffbb55" : "#77777f";
-    ctx.fillText(def.params[i][2](val), e.x, e.y + 57);
+  ctx.font = F.small;
+  ctx.fillStyle = sel ? "#ffbb55" : "#77777f";
+  ctx.fillText(def.f(pv[def.k]), e.x, e.y + 57);
+  if (PRESSED.has("enc:" + i)) {
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, 27, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.22)";
+    ctx.fill();
   }
 }
 
-/* --- master volume + level/data ------------------------------------------ */
-function drawBigKnobs() {
-  ring(G.knobs[0].x, G.knobs[0].y, 35, state.masterVol, PRESSED.has("knob:master"));
-  ring(G.knobs[1].x, G.knobs[1].y, 35, currentPageValue(state.selParam), PRESSED.has("knob:level"));
-}
-
-/* --- rectangular buttons ------------------------------------------------- */
-function drawButtons() {
-  for (const b of BTNS) {
-    const on = buttonActive(b.id);
-    if (b.page) {
-      if (on) goldFace(b);
-      label(b, on ? "#1e1405" : "#d5d5dd", "600 11px ");
-      ctx.fillStyle = on ? "rgba(40,26,6,.6)" : "rgba(255,204,0,.45)";
-      ctx.fillRect(b.x + b.w / 2 - 3, b.y + b.h - 8, 6, 2);
-    } else if (b.icon) {
-      if (on) {
-        rr(ctx, b.x, b.y, b.w, b.h, 8);
-        ctx.fillStyle = "rgba(255,176,64,.18)";
-        ctx.fill();
-        ctx.strokeStyle = "rgba(255,196,100,.55)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
-      drawIcon(b, on);
-    } else if (b.teal) {
-      /* FUNC is a latch, not a lit key: teal face + white ring while engaged */
-      label(b, "#04231f", "700 12px ");
-      if (state.fine) {
-        rr(ctx, b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3, 6.5);
-        ctx.strokeStyle = "rgba(255,255,255,.92)";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      }
-    } else if (on) {
-      goldFace(b);
-      label(b, "#1e1405", "600 10px ");
-    } else {
-      label(b, "#dcdce3", "600 10px ");
-    }
+function drawKnobRegion(k, idx) {
+  const hot = PRESSED.has("knob:" + idx);
+  ring(k.x, k.y, 35, idx === 0 ? state.masterVol : currentPageValue(state.selParam), hot);
+  if (hot) {
+    ctx.beginPath();
+    ctx.arc(k.x, k.y, 30, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.22)";
+    ctx.fill();
   }
 }
 
 function goldFace(b) {
+  if (!b._gold) {
+    const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+    g.addColorStop(0, "#f4c469");
+    g.addColorStop(0.5, "#d9a03c");
+    g.addColorStop(1, "#b1771f");
+    b._gold = g;
+  }
   rr(ctx, b.x, b.y, b.w, b.h, 8);
-  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
-  g.addColorStop(0, "#f4c469");
-  g.addColorStop(0.5, "#d9a03c");
-  g.addColorStop(1, "#b1771f");
-  ctx.fillStyle = g;
+  ctx.fillStyle = b._gold;
   ctx.fill();
   ctx.strokeStyle = "rgba(255,228,166,.7)";
   ctx.lineWidth = 1;
   ctx.stroke();
 }
 
-function label(b, color, font) {
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.font = font + UI;
-  ctx.fillStyle = color;
-  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+function drawButtonRegion(b) {
+  const on = buttonActive(b.id);
+  if (b.page) {
+    if (on) goldFace(b);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "600 11px " + UI;
+    ctx.fillStyle = on ? "#1e1405" : "#d5d5dd";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+    ctx.fillStyle = on ? "rgba(40,26,6,.6)" : "rgba(255,204,0,.45)";
+    ctx.fillRect(b.x + b.w / 2 - 3, b.y + b.h - 8, 6, 2);
+  } else if (b.icon) {
+    if (on) {
+      rr(ctx, b.x, b.y, b.w, b.h, 8);
+      ctx.fillStyle = "rgba(255,176,64,.18)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,196,100,.55)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    drawIcon(b, on);
+  } else if (b.teal) {
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = F.btnLg;
+    ctx.fillStyle = "#04231f";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+    if (state.fine) {
+      rr(ctx, b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3, 6.5);
+      ctx.strokeStyle = "rgba(255,255,255,.92)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  } else if (on) {
+    goldFace(b);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = F.btn;
+    ctx.fillStyle = "#1e1405";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+  } else {
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = F.btn;
+    ctx.fillStyle = "#dcdce3";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+  }
+  if (PRESSED.has("btn:" + b.id)) {
+    rr(ctx, b.x, b.y + 1, b.w, b.h - 1, 8);
+    ctx.fillStyle = "rgba(0,0,0,.3)";
+    ctx.fill();
+  }
 }
 
 function drawIcon(b, on) {
@@ -902,92 +1086,96 @@ function buttonActive(id) {
   if (id === "play") return state.isPlaying;
   if (id === "func") return state.fine;
   if (id === "unison") return state.unison;
-  if (id.startsWith("page")) return PAGES[+id.slice(4)] === state.currentPage;
+  if (id.indexOf("page") === 0 && id.length === 5) return PAGES[+id.slice(4)] === state.currentPage;
   return false;
 }
 
-/* --- 16 trigs ------------------------------------------------------------ */
-function drawTrigs() {
+function drawTrigRegion(t) {
   const tr = state.tracks[state.currentTrack];
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
+  const on = tr.trigs[t.i] === 1;
+  const cur = state.isPlaying && state.currentStep === t.i;
 
-  for (const t of TRIGS) {
-    const on = tr.trigs[t.i] === 1;
-    const cur = state.isPlaying && state.currentStep === t.i;
-    const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
-
-    if (on) {
-      rr(ctx, t.x, t.y, t.w, t.h, 9);
+  if (on) {
+    if (!t._g) {
       const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
       g.addColorStop(0, "rgba(255,180,108,1)");
       g.addColorStop(0.45, "rgba(255,140,58,1)");
       g.addColorStop(1, "rgba(209,82,15,1)");
-      ctx.fillStyle = g;
-      ctx.fill();
-      ctx.strokeStyle = "rgba(255,208,150,.6)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      t._g = g;
     }
-
-    ctx.font = "700 17px " + UI;
-    ctx.fillStyle = on ? "#2b1200" : "rgba(196,196,206,.85)";
-    ctx.fillText(String(t.i + 1), cx, cy + 1);
-
-    ctx.beginPath();
-    ctx.arc(t.x + 10, t.y + 10, 2.6, 0, 6.2832);
-    ctx.fillStyle = on ? "rgba(70,26,0,.9)" : "rgba(255,255,255,.14)";
+    rr(ctx, t.x, t.y, t.w, t.h, 9);
+    ctx.fillStyle = t._g;
     ctx.fill();
+    ctx.strokeStyle = "rgba(255,208,150,.6)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  if (PRESSED.has("trig:" + t.i)) {
+    rr(ctx, t.x, t.y + 1, t.w, t.h - 1, 9);
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.fill();
+  }
 
-    if (cur) {
-      rr(ctx, t.x - 2, t.y - 2, t.w + 4, t.h + 4, 11);
-      ctx.strokeStyle = "rgba(255,255,255,.9)";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = F.num;
+  ctx.fillStyle = on ? "#2b1200" : "rgba(196,196,206,.85)";
+  ctx.fillText(String(t.i + 1), t.x + t.w / 2, t.y + t.h / 2 + 1);
+
+  ctx.beginPath();
+  ctx.arc(t.x + 10, t.y + 10, 2.6, 0, 6.2832);
+  ctx.fillStyle = on ? "rgba(70,26,0,.9)" : "rgba(255,255,255,.14)";
+  ctx.fill();
+
+  if (cur) {
+    rr(ctx, t.x - 2, t.y - 2, t.w + 4, t.h + 4, 11);
+    ctx.strokeStyle = "rgba(255,255,255,.9)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 }
 
-/* --- T1..T4 -------------------------------------------------------------- */
-function drawTrackButtons() {
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  for (const t of TRACKBTN) {
-    const on = state.currentTrack === t.i;
-    const rgb = TRACK_RGB[t.i];
-
-    if (on) {
-      rr(ctx, t.x, t.y, t.w, t.h, 9);
+function drawTrackRegion(t) {
+  const on = state.currentTrack === t.i;
+  const rgb = TRACK_RGB[t.i];
+  if (on) {
+    if (!t._g) {
       const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
       g.addColorStop(0, "rgba(" + rgb + ",1)");
       g.addColorStop(0.6, "rgba(" + rgb + ",.82)");
       g.addColorStop(1, "rgba(" + rgb + ",.55)");
-      ctx.fillStyle = g;
-      ctx.fill();
-      ctx.strokeStyle = "rgba(255,255,255,.55)";
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    } else {
-      rr(ctx, t.x + 1, t.y + 1, t.w - 2, t.h - 2, 8);
-      ctx.fillStyle = "rgba(" + rgb + ",.10)";
-      ctx.fill();
-      ctx.strokeStyle = "rgba(" + rgb + ",.35)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
+      t._g = g;
     }
-
-    ctx.font = "700 18px " + UI;
-    ctx.fillStyle = on ? "rgba(255,255,255,.98)" : "rgba(" + rgb + ",.85)";
-    ctx.fillText("T" + (t.i + 1), t.x + t.w / 2, t.y + t.h / 2 - 5);
-
-    ctx.font = "600 8px " + UI;
-    ctx.fillStyle = on ? "rgba(255,255,255,.65)" : "rgba(255,255,255,.28)";
-    ctx.fillText("MUTE", t.x + t.w / 2, t.y + t.h - 13);
+    rr(ctx, t.x, t.y, t.w, t.h, 9);
+    ctx.fillStyle = t._g;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.55)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  } else {
+    rr(ctx, t.x + 1, t.y + 1, t.w - 2, t.h - 2, 8);
+    ctx.fillStyle = "rgba(" + rgb + ",.10)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(" + rgb + ",.35)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
   }
+  if (PRESSED.has("track:" + t.i)) {
+    rr(ctx, t.x, t.y + 1, t.w, t.h - 1, 9);
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.fill();
+  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = F.track;
+  ctx.fillStyle = on ? "rgba(255,255,255,.98)" : "rgba(" + rgb + ",.85)";
+  ctx.fillText("T" + (t.i + 1), t.x + t.w / 2, t.y + t.h / 2 - 5);
+  ctx.font = F.tiny;
+  ctx.fillStyle = on ? "rgba(255,255,255,.65)" : "rgba(255,255,255,.28)";
+  ctx.fillText("MUTE", t.x + t.w / 2, t.y + t.h - 13);
 }
 
-/* --- pattern page LEDs --------------------------------------------------- */
-function drawPageLeds() {
+function drawLedsRegion() {
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
   ctx.font = "500 8.5px " + UI;
@@ -1005,8 +1193,7 @@ function drawPageLeds() {
   }
 }
 
-/* --- WAV recorder (REC + SAVE WAV) --------------------------------------- */
-function drawRecorder() {
+function drawRecRegion() {
   const r = G.rec;
   const t = performance.now();
 
@@ -1036,10 +1223,13 @@ function drawRecorder() {
   } else {
     ctx.beginPath();
     ctx.arc(r.x, r.y, r.r, 0, 6.2832);
-    const g = ctx.createRadialGradient(r.x - 4, r.y - 5, 2, r.x, r.y, r.r);
-    g.addColorStop(0, "#74251f");
-    g.addColorStop(1, "#3a1210");
-    ctx.fillStyle = g;
+    if (!r._off) {
+      const g = ctx.createRadialGradient(r.x - 4, r.y - 5, 2, r.x, r.y, r.r);
+      g.addColorStop(0, "#74251f");
+      g.addColorStop(1, "#3a1210");
+      r._off = g;
+    }
+    ctx.fillStyle = r._off;
     ctx.fill();
     ctx.strokeStyle = "rgba(255,90,74,.5)";
     ctx.lineWidth = 1.2;
@@ -1051,16 +1241,23 @@ function drawRecorder() {
   ctx.font = "700 9.5px " + UI;
   ctx.fillStyle = state.isRecordingWav ? "#ff5a48" : "#c8c8d0";
   ctx.fillText("REC", r.x + 19, r.y - 4);
-  ctx.font = "500 8px " + UI;
+  ctx.font = F.tiny;
   ctx.fillStyle = state.isRecordingWav ? "#ff8574" : "#6f6f79";
   ctx.fillText(recTime(), r.x + 19, r.y + 9);
 
   const s = G.saveWav;
   rr(ctx, s.x, s.y, s.w, s.h, 7);
-  const sg = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
-  sg.addColorStop(0, state.hasRec ? "#3d4137" : "#2c2c32");
-  sg.addColorStop(1, state.hasRec ? "#282b24" : "#1e1e22");
-  ctx.fillStyle = sg;
+  if (!s._off) {
+    const g = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+    g.addColorStop(0, "#2c2c32");
+    g.addColorStop(1, "#1e1e22");
+    s._off = g;
+    const g2 = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+    g2.addColorStop(0, "#3d4137");
+    g2.addColorStop(1, "#282b24");
+    s._on = g2;
+  }
+  ctx.fillStyle = state.hasRec ? s._on : s._off;
   ctx.fill();
   ctx.strokeStyle = state.hasRec ? "rgba(255,204,0,.55)" : "rgba(255,255,255,.10)";
   ctx.lineWidth = 1;
@@ -1069,15 +1266,25 @@ function drawRecorder() {
   ctx.font = "700 8.5px " + UI;
   ctx.fillStyle = state.hasRec ? "#ffd166" : "#a9a9b3";
   ctx.fillText("SAVE WAV", s.x + s.w / 2, s.y + s.h / 2 + 0.5);
+
+  if (PRESSED.has("btn:rec")) {
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r + 2, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.fill();
+  }
+  if (PRESSED.has("btn:savewav")) {
+    rr(ctx, s.x, s.y, s.w, s.h, 7);
+    ctx.fillStyle = "rgba(0,0,0,.3)";
+    ctx.fill();
+  }
 }
 
-/* --- status plate -------------------------------------------------------- */
-function drawFooter() {
+function drawFooterRegion() {
   const tr = state.tracks[state.currentTrack];
   const page = state.currentPage;
-  const def = PAGE_DEFS[page];
-  const key = def.params[state.selParam][0];
-  const val = tr.params[page][key];
+  const def = PAGE_DEFS[page][state.selParam];
+  const val = tr.params[page][def.k];
   const rgb = TRACK_RGB[state.currentTrack];
 
   ctx.textAlign = "left";
@@ -1088,7 +1295,7 @@ function drawFooter() {
   ctx.fillStyle = "rgba(" + rgb + ",1)";
   ctx.fill();
 
-  ctx.font = "700 17px " + UI;
+  ctx.font = F.foot;
   ctx.fillStyle = "#f1f1f5";
   ctx.fillText("TRACK " + (state.currentTrack + 1), 44, 663);
 
@@ -1096,14 +1303,14 @@ function drawFooter() {
   ctx.fillStyle = "#8b8b95";
   ctx.fillText(state.bank + state.patternNo + "  " + state.patternName, 44, 683);
 
-  ctx.font = "600 9px " + UI;
+  ctx.font = F.small;
   ctx.fillStyle = "#77777f";
-  ctx.fillText(page + "  /  " + def.params[state.selParam][1], 44, 703);
+  ctx.fillText(page + "  /  " + def.l, 44, 703);
 
   ctx.textAlign = "right";
   ctx.font = "700 11px " + UI;
   ctx.fillStyle = "#ffcc00";
-  ctx.fillText(def.params[state.selParam][2](val), 250, 703);
+  ctx.fillText(def.f(val), 250, 703);
 
   rr(ctx, 44, 712, 206, 4, 2);
   ctx.fillStyle = "#26262b";
@@ -1113,18 +1320,18 @@ function drawFooter() {
   ctx.fill();
 
   ctx.textAlign = "left";
-  ctx.font = "500 9px " + UI;
+  ctx.font = F.small;
   ctx.fillStyle = "#63636d";
   ctx.fillText("TAP TRIG 1\u201316 TO TOGGLE STEPS", 300, 652);
   ctx.fillText("DRAG ENCODERS A\u2013H UP / DOWN TO EDIT", 300, 668);
   ctx.fillText("FUNC = FINE \u00b7 PAGE / \u25c0 \u25b6 = PARAM PAGE", 300, 684);
 
   ctx.textAlign = "right";
-  ctx.font = "700 26px " + UI;
+  ctx.font = F.bpm;
   ctx.fillStyle = "#f4f4f8";
   ctx.fillText(state.bpm.toFixed(1), 776, 664);
   ctx.textAlign = "left";
-  ctx.font = "600 9px " + UI;
+  ctx.font = F.small;
   ctx.fillStyle = "#6e6e78";
   ctx.fillText("BPM", 784, 668);
 
@@ -1138,7 +1345,6 @@ function drawFooter() {
 
   ctx.textAlign = "right";
   ctx.fillStyle = state.isRecordingWav ? "#ff5a48" : (state.hasRec ? "#b9a25a" : "#5f5f69");
-  ctx.font = "600 9.5px " + UI;
   ctx.fillText(state.isRecordingWav ? "REC " + recTime() : (state.hasRec ? "WAV READY" : "NO WAV"), 966, 700);
 
   const now = performance.now();
@@ -1151,36 +1357,38 @@ function drawFooter() {
   }
 }
 
-/* --- press feedback ------------------------------------------------------ */
-const PRESSED = new Set();
-function drawPressed() {
-  if (!PRESSED.size) return;
-  for (const b of BTNS) if (PRESSED.has("btn:" + b.id)) shadeRect(b.x, b.y + 1, b.w, b.h - 1, 8);
-  for (const t of TRIGS) if (PRESSED.has("trig:" + t.i)) shadeRect(t.x, t.y + 1, t.w, t.h - 1, 9);
-  for (const t of TRACKBTN) if (PRESSED.has("track:" + t.i)) shadeRect(t.x, t.y + 1, t.w, t.h - 1, 9);
-  const s = G.saveWav;
-  if (PRESSED.has("btn:savewav")) shadeRect(s.x, s.y, s.w, s.h, 7);
-  if (PRESSED.has("btn:rec")) {
-    ctx.beginPath();
-    ctx.arc(G.rec.x, G.rec.y, G.rec.r + 2, 0, 6.2832);
-    ctx.fillStyle = "rgba(0,0,0,.35)";
-    ctx.fill();
-  }
+/* --------------------------------------------------- 5. REGION DEFINITIONS */
+
+function buildRegions() {
+  REGIONS.clear();
+  const s = G.screen;
+  addRegion("screen", s.x, s.y, s.w, s.h, drawScreenRegion);
+
   for (let i = 0; i < 8; i++) {
-    if (PRESSED.has("enc:" + i)) {
-      const e = G.enc[i];
-      ctx.beginPath(); ctx.arc(e.x, e.y, 27, 0, 6.2832);
-      ctx.fillStyle = "rgba(0,0,0,.22)"; ctx.fill();
-    }
+    const e = G.enc[i];
+    addRegion("enc:" + i, e.x - 40, e.y - 40, 80, 104, () => drawEncoderRegion(i));
   }
+  G.knobs.forEach((k, i) => {
+    addRegion("knob:" + i, k.x - 42, k.y - 42, 84, 108, () => drawKnobRegion(k, i));
+  });
+  for (const b of BTNS) {
+    addRegion("btn:" + b.id, b.x - 2, b.y - 2, b.w + 4, b.h + 4, () => drawButtonRegion(b));
+  }
+  for (const t of TRIGS) {
+    addRegion("trig:" + t.i, t.x - 3, t.y - 3, t.w + 6, t.h + 6, () => drawTrigRegion(t));
+  }
+  for (const t of TRACKBTN) {
+    addRegion("track:" + t.i, t.x - 3, t.y - 3, t.w + 6, t.h + 6, () => drawTrackRegion(t));
+  }
+  addRegion("leds", 790, 434, 190, 28, drawLedsRegion);
+  addRegion("rec", G.recPanel.x, G.recPanel.y, G.recPanel.w, G.recPanel.h, drawRecRegion);
+  addRegion("footer", G.footer.x, G.footer.y, G.footer.w, G.footer.h, drawFooterRegion);
 }
-function shadeRect(x, y, w, h, r) {
-  rr(ctx, x, y, w, h, r);
-  ctx.fillStyle = "rgba(0,0,0,.30)";
-  ctx.fill();
-}
+buildRegions();
 
 /* ============================================================== 6. INPUT */
+
+const PRESSED = new Set();
 
 function canvasPoint(cx, cy) {
   const r = canvas.getBoundingClientRect();
@@ -1191,7 +1399,7 @@ const HITS = [];
 function buildHits() {
   HITS.length = 0;
   for (let i = 0; i < 8; i++) HITS.push({ k: "enc:" + i, t: "enc", i: i, x: G.enc[i].x, y: G.enc[i].y, r: 38 });
-  for (const k of G.knobs) HITS.push({ k: "knob:" + k.id, t: "knob", id: k.id, x: k.x, y: k.y, r: 40 });
+  G.knobs.forEach((k, i) => HITS.push({ k: "knob:" + i, t: "knob", i: i, x: k.x, y: k.y, r: 40 }));
   for (const t of TRIGS) HITS.push({ k: "trig:" + t.i, t: "trig", i: t.i, x: t.x, y: t.y, w: t.w, h: t.h });
   for (const t of TRACKBTN) HITS.push({ k: "track:" + t.i, t: "track", i: t.i, x: t.x, y: t.y, w: t.w, h: t.h });
   for (const b of BTNS) HITS.push({ k: "btn:" + b.id, t: "btn", id: b.id, x: b.x, y: b.y, w: b.w, h: b.h });
@@ -1214,90 +1422,124 @@ function hitTest(x, y) {
   return null;
 }
 
-const drags = new Map();                 /* touch identifier -> drag state */
+const drags = new Map();          /* finger id -> drag state (applied per frame) */
 
 function currentPageValue(i) {
-  const d = PAGE_DEFS[state.currentPage];
-  return state.tracks[state.currentTrack].params[state.currentPage][d.params[i][0]];
+  const d = PAGE_DEFS[state.currentPage][i];
+  return state.tracks[state.currentTrack].params[state.currentPage][d.k];
 }
 function setParam(i, v) {
-  const d = PAGE_DEFS[state.currentPage];
-  state.tracks[state.currentTrack].params[state.currentPage][d.params[i][0]] = clamp(Math.round(v), 0, MAXV);
-  state.selParam = i;
+  const page = state.currentPage;
+  const d = PAGE_DEFS[page][i];
+  state.tracks[state.currentTrack].params[page][d.k] = clamp(Math.round(v), 0, MAXV);
+  if (state.selParam !== i) {
+    const prev = state.selParam;
+    state.selParam = i;
+    touch("enc:" + prev);
+    oledDirty = true;
+    touch("screen");
+  }
   oledDirty = true;
-  invalidate();
+  touch("enc:" + i);
+  touch("screen");
+  touch("footer");
+}
+
+function applyDrags() {
+  for (const d of drags.values()) {
+    if (!d.moved) continue;
+    d.moved = false;
+    const sens = d.kind === "knob" ? 0.42 : (state.fine ? 0.20 : 0.62);
+    const v = clamp(d.v0 + (d.y0 - d.py) * sens, 0, MAXV);
+    if (d.kind === "enc") {
+      setParam(d.i, v);
+    } else if (d.i === 0) {
+      state.masterVol = Math.round(v);
+      if (masterGain) masterGain.gain.value = gainFromVolume();
+      touch("knob:0");
+    } else {
+      setParam(state.selParam, v);
+      touch("knob:1");
+    }
+  }
 }
 
 function pointerDown(px, py, id) {
   const hit = hitTest(px, py);
   if (!hit) return;
-  PRESSED.add(hit.k);
 
   if (hit.t === "enc") {
+    const prev = state.selParam;
     state.selParam = hit.i;
-    drags.set(id, { kind: "enc", i: hit.i, y0: py, v0: currentPageValue(hit.i), k: hit.k });
     oledDirty = true;
-  } else if (hit.t === "knob") {
-    const base = hit.id === "master" ? state.masterVol : currentPageValue(state.selParam);
-    drags.set(id, { kind: "knob", knob: hit.id, y0: py, v0: base, k: hit.k });
-  } else if (hit.t === "trig") {
+    touch("screen");
+    drags.set(id, { kind: "enc", i: hit.i, y0: py, py: py, v0: currentPageValue(hit.i), moved: false });
+    PRESSED.add(hit.k);
+    touch(hit.k);
+    if (prev !== hit.i) touch("enc:" + prev);
+    return;
+  }
+  if (hit.t === "knob") {
+    const base = hit.i === 0 ? state.masterVol : currentPageValue(state.selParam);
+    drags.set(id, { kind: "knob", i: hit.i, y0: py, py: py, v0: base, moved: false });
+    PRESSED.add(hit.k);
+    touch(hit.k);
+    return;
+  }
+  if (hit.t === "trig") {
     const tr = state.tracks[state.currentTrack];
     tr.trigs[hit.i] = tr.trigs[hit.i] ? 0 : 1;
-    oledDirty = true;
     if (tr.trigs[hit.i]) previewVoice(state.currentTrack, hit.i);
-    PRESSED.delete(hit.k);
-  } else if (hit.t === "track") {
-    selectTrack(hit.i);
-    PRESSED.delete(hit.k);
-  } else if (hit.t === "btn" || hit.t === "rec") {
-    pressButton(hit.id);
-    setTimeout(() => { PRESSED.delete(hit.k); invalidate(); }, 110);
+    oledDirty = true;
+    touch("trig:" + hit.i);
+    return;
   }
-  invalidate();
+  if (hit.t === "track") {
+    selectTrack(hit.i);
+    return;
+  }
+  /* buttons + REC */
+  pressButton(hit.id);
+  PRESSED.add(hit.k);
+  touch(hit.k);
+  setTimeout(() => { PRESSED.delete(hit.k); touch(hit.k); }, 110);
 }
 
 function pointerMove(px, py, id) {
   const d = drags.get(id);
   if (!d) return;
-  const sens = d.kind === "knob" ? 0.42 : (state.fine ? 0.20 : 0.62);
-  const v = clamp(d.v0 + (d.y0 - py) * sens, 0, MAXV);
-  if (d.kind === "enc") {
-    setParam(d.i, v);
-  } else if (d.knob === "master") {
-    state.masterVol = Math.round(v);
-    if (masterGain) masterGain.gain.value = gainFromVolume();
-    invalidate();
-  } else {
-    setParam(state.selParam, v);
-  }
+  d.py = py;                 /* coalesced: applied once in the next frame */
+  d.moved = true;
+  invalidate();
 }
 
 function pointerUp(id) {
   const d = drags.get(id);
   if (!d) return;
-  PRESSED.delete(d.k);
+  if (d.moved) { applyDrags(); }
   drags.delete(id);
-  oledDirty = true;
-  invalidate();
+  const key = d.kind === "enc" ? "enc:" + d.i : "knob:" + d.i;
+  PRESSED.delete(key);
+  touch(key);
 }
 
 /* touch ------------------------------------------------------------------- */
 canvas.addEventListener("touchstart", e => {
   e.preventDefault();
   audioUnlock();
-  for (let i = 0; i < e.changedTouches.length; i++) {
-    const t = e.changedTouches[i];
-    const p = canvasPoint(t.clientX, t.clientY);
-    pointerDown(p.x, p.y, t.identifier);
+  const t = e.changedTouches;
+  for (let i = 0; i < t.length; i++) {
+    const p = canvasPoint(t[i].clientX, t[i].clientY);
+    pointerDown(p.x, p.y, t[i].identifier);
   }
 }, { passive: false });
 
 canvas.addEventListener("touchmove", e => {
   e.preventDefault();
-  for (let i = 0; i < e.changedTouches.length; i++) {
-    const t = e.changedTouches[i];
-    const p = canvasPoint(t.clientX, t.clientY);
-    pointerMove(p.x, p.y, t.identifier);
+  const t = e.changedTouches;
+  for (let i = 0; i < t.length; i++) {
+    const p = canvasPoint(t[i].clientX, t[i].clientY);
+    pointerMove(p.x, p.y, t[i].identifier);
   }
 }, { passive: false });
 
@@ -1307,7 +1549,7 @@ function endTouch(e) {
 canvas.addEventListener("touchend", endTouch, { passive: true });
 canvas.addEventListener("touchcancel", endTouch, { passive: true });
 
-/* mouse (desktop testing) -------------------------------------------------- */
+/* mouse (desktop) ---------------------------------------------------------- */
 let mouseDown = false;
 canvas.addEventListener("mousedown", e => {
   e.preventDefault();
@@ -1334,18 +1576,29 @@ document.addEventListener("dblclick", e => e.preventDefault());
 /* =========================================================== 7. ACTIONS */
 
 function selectTrack(i) {
+  if (state.currentTrack === i) return;
+  touch("track:" + state.currentTrack);
   state.currentTrack = i;
   state.selParam = 0;
   oledDirty = true;
-  invalidate();
+  touch("track:" + i);
+  touch("screen");
+  touch("footer");
+  for (let k = 0; k < 16; k++) touch("trig:" + k);
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
 }
 
 function nextPage(dir) {
   const i = PAGES.indexOf(state.currentPage);
+  const prev = i;
   state.currentPage = PAGES[(i + dir + PAGES.length) % PAGES.length];
   state.selParam = 0;
   oledDirty = true;
-  invalidate();
+  touch("screen");
+  touch("footer");
+  touch("btn:page" + prev);
+  touch("btn:page" + PAGES.indexOf(state.currentPage));
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
 }
 
 function nudge(dir) {
@@ -1365,13 +1618,17 @@ function pasteTrack() {
   t.params = JSON.parse(JSON.stringify(clip.params));
   state.selParam = 0;
   oledDirty = true;
-  invalidate();
+  touch("screen");
+  touch("footer");
+  for (let k = 0; k < 16; k++) touch("trig:" + k);
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
   toast("PASTED TO TRACK " + (state.currentTrack + 1));
 }
 function clearTrack() {
   state.tracks[state.currentTrack].trigs.fill(0);
   oledDirty = true;
-  invalidate();
+  touch("screen");
+  for (let k = 0; k < 16; k++) touch("trig:" + k);
   toast("TRACK " + (state.currentTrack + 1) + " CLEARED");
 }
 
@@ -1396,13 +1653,18 @@ function pressButton(id) {
     case "savewav": saveWav(); break;
     case "rec": toggleRec(); break;
     default:
-      if (id.indexOf("page") === 0) {
+      if (id.indexOf("page") === 0 && id.length === 5) {
+        const prev = PAGES.indexOf(state.currentPage);
         state.currentPage = PAGES[+id.slice(4)];
         state.selParam = 0;
         oledDirty = true;
+        touch("screen");
+        touch("footer");
+        touch("btn:page" + prev);
+        touch("btn:page" + id.slice(4));
+        for (let k = 0; k < 8; k++) touch("enc:" + k);
       }
   }
-  invalidate();
 }
 
 let lastTap = 0;
@@ -1417,6 +1679,7 @@ function tapTempo() {
     const bpm = clamp(Math.round(600000 / avg) / 10, 30, 300);
     state.bpm = bpm;
     oledDirty = true;
+    touch("screen");
     toast("BPM " + bpm.toFixed(1));
   }
 }
@@ -1424,13 +1687,13 @@ function tapTempo() {
 function toast(msg) {
   state.msg = msg;
   state.msgUntil = performance.now() + 1700;
-  invalidate();
+  touch("footer");
   clearTimeout(toast.t);
-  toast.t = setTimeout(invalidate, 1780);
+  toast.t = setTimeout(() => touch("footer"), 1780);
 }
 
 /* persistence ------------------------------------------------------------- */
-const STORE_KEY = "digitone.panel.v1";
+const STORE_KEY = "digitone.panel.v2";
 function saveProject() {
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify({
@@ -1451,13 +1714,13 @@ function loadProject(silent) {
         const trigs = new Array(16).fill(0);
         (src.trigs || []).forEach((v, k) => { if (k < 16) trigs[k] = v ? 1 : 0; });
         state.tracks[i].trigs = trigs;
-        for (const p of PAGES) if (src.params && src.params[p]) Object.assign(state.tracks[i].params[p], src.params[p]);
+        if (src.params) for (const p of PAGES) if (src.params[p]) Object.assign(state.tracks[i].params[p], src.params[p]);
       }
       if (typeof d.bpm === "number") state.bpm = d.bpm;
       if (typeof d.masterVol === "number") state.masterVol = d.masterVol;
     }
     oledDirty = true;
-    invalidate();
+    touchAll();
     if (!silent) toast("PROJECT LOADED");
     return true;
   } catch (err) {
@@ -1483,8 +1746,6 @@ function audioUnlock() {
       masterGain.gain.value = gainFromVolume();
       masterGain.connect(actx.destination);
 
-      /* PCM tap for the WAV recorder (ScriptProcessor: universally available
-         on iOS 16, and it only fires ~11x per second) */
       if (actx.createScriptProcessor) {
         recNode = actx.createScriptProcessor(4096, 1, 1);
         recNode.onaudioprocess = ev => {
@@ -1492,7 +1753,7 @@ function audioUnlock() {
           const d = ev.inputBuffer.getChannelData(0);
           recBufs.push(new Float32Array(d));
           recLen += d.length;
-          if (recLen > actx.sampleRate * 180) stopRec(true);   /* 3 minute cap */
+          if (recLen > actx.sampleRate * 180) stopRec(true);
         };
         masterGain.connect(recNode);
         const mute = actx.createGain();
@@ -1527,7 +1788,7 @@ function voice(trackIdx, step, when) {
   modGain.gain.value = car.frequency.value * idx;
 
   lp.type = "lowpass";
-  lp.frequency.value = Math.min(16000, 80 * Math.pow(2, (flt.cutoff / MAXV) * 7.4));
+  lp.frequency.value = Math.min(16000, 80 * Math.pow(2, (flt.freq / MAXV) * 7.4));
   lp.Q.value = 0.4 + (flt.resonance / MAXV) * 14;
 
   mod.connect(modGain);
@@ -1578,28 +1839,32 @@ function startPlay() {
   state.currentStep = -1;
   schedStep = 0;
   pending.length = 0;
-
   if (actx) {
     nextTime = actx.currentTime + 0.06;
     seqTimer = setInterval(scheduler, 25);
   } else {
     seqTimer = setInterval(() => {
-      state.currentStep = (state.currentStep + 1) % 16;
-      oledDirty = true;
-      invalidate();
+      advanceStep((state.currentStep + 1) % 16);
     }, 60000 / (state.bpm * 4));
   }
   oledDirty = true;
-  invalidate();
+  touch("btn:play");
+  touch("btn:stop");
+  touch("screen");
 }
 
 function stopPlay() {
   if (seqTimer) { clearInterval(seqTimer); seqTimer = null; }
   state.isPlaying = false;
+  const prev = state.currentStep;
   state.currentStep = -1;
   pending.length = 0;
+  if (prev >= 0) touch("trig:" + prev);
   oledDirty = true;
-  invalidate();
+  touch("btn:play");
+  touch("btn:stop");
+  touch("screen");
+  touch("footer");
 }
 
 function scheduler() {
@@ -1616,15 +1881,17 @@ function scheduler() {
   }
 }
 
+function advanceStep(s) {
+  const prev = state.currentStep;
+  state.currentStep = s;
+  if (prev >= 0) touch("trig:" + prev);
+  touch("trig:" + s);
+}
+
 function consumeScheduledSteps() {
   if (!actx) return;
   const now = actx.currentTime;
-  let changed = false;
-  while (pending.length && pending[0].t <= now) {
-    state.currentStep = pending.shift().s;
-    changed = true;
-  }
-  if (changed) { oledDirty = true; needsRedraw = true; }
+  while (pending.length && pending[0].t <= now) advanceStep(pending.shift().s);
 }
 
 /* ------------------------------------------------------------ 10. REC/WAV */
@@ -1656,7 +1923,8 @@ function startRec() {
   state.hasRec = false;
   if (!state.isPlaying) startPlay();
   toast("RECORDING");
-  invalidate();
+  touch("rec");
+  touch("footer");
 }
 
 function stopRec(auto) {
@@ -1665,7 +1933,8 @@ function stopRec(auto) {
   state.hasRec = recLen > 0;
   if (auto) stopPlay();
   toast(state.hasRec ? "CAPTURED " + fmtTime(recLen / actx.sampleRate) : "NOTHING RECORDED");
-  invalidate();
+  touch("rec");
+  touch("footer");
 }
 
 function encodeWav() {
@@ -1710,11 +1979,17 @@ function saveWav() {
 
 /* ============================================================== 11. BOOT */
 
+ATLAS.fg = buildAtlas(FG);
+ATLAS.bg = buildAtlas(BG);
+octx.imageSmoothingEnabled = false;
+
 buildHits();
 resize();
 loadProject(true);
 if (visualViewport) visualViewport.addEventListener("resize", resize, { passive: true });
 oledDirty = true;
+drawUI();
+if (masterGain) masterGain.gain.value = gainFromVolume();
 invalidate();
 </script>
 </body>
