@@ -1,0 +1,1721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0b0b0d">
+<title>Digitone</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#0b0b0d;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent;overscroll-behavior:none;touch-action:none}
+  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  #panel{display:block;touch-action:none;border-radius:15px;
+    box-shadow:0 26px 70px rgba(0,0,0,.8),0 1px 0 rgba(255,255,255,.05)}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="panel" width="1000" height="750"></canvas></div>
+<script>
+"use strict";
+/* ============================================================================
+   ELEKTRON DIGITONE — CANVAS FRONT PANEL
+   ----------------------------------------------------------------------------
+   RENDERING ARCHITECTURE
+   · One <canvas> (1000 x 750 design units) sized in CSS + capped devicePixelRatio.
+   · Every static pixel (casing, print, button faces, knob bodies) is rasterised
+     ONCE into an offscreen canvas. A "frame" is therefore: 1 blit + only the
+     live widgets (OLED, encoder rings, LEDs, status text).
+   · Dirty-flag loop: a frame is requested only by invalidate(). Nothing moving,
+     sequencer stopped, not recording  =>  no rAF callbacks, 0% graphics CPU.
+   · The OLED is a 180x100 buffer painted with a hand-built 5x7 bitmap font and
+     up-scaled with image smoothing OFF (crisp hardware pixels, and it is only
+     repainted when its content really changed).
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- 1. STATE */
+
+const MAXV = 127;
+
+const pct   = v => String(Math.round(v / MAXV * 100));
+const bip   = v => (v > 64 ? "+" : "") + (v - 64);
+const ratio = v => (0.25 + v / MAXV * 7.75).toFixed(2);
+const hz    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8)));
+const en    = (...n) => v => n[Math.min(n.length - 1, Math.round(v / MAXV * (n.length - 1)))];
+
+const PAGES = ["SYN1", "SYN2", "FLTR", "AMP", "LFO"];
+
+/* [key, OLED label, value formatter] + defaults, eight per page = encoders A-H */
+const PAGE_DEFS = {
+  SYN1: {
+    params: [
+      ["harm",     "HARM",   bip],
+      ["detune",   "DETUNE", bip],
+      ["feedback", "FEEDBK", pct],
+      ["mix",      "MIX",    pct],
+      ["ratioA",   "RAT A",  ratio],
+      ["ratioB",   "RAT B",  ratio],
+      ["ratioC",   "RAT C",  ratio],
+      ["level",    "LEVEL",  pct]
+    ],
+    def: { harm: 64, detune: 64, feedback: 42, mix: 96, ratioA: 40, ratioB: 72, ratioC: 24, level: 104 }
+  },
+  SYN2: {
+    params: [
+      ["amtA",   "A AMT",  pct],
+      ["amtB",   "B AMT",  pct],
+      ["drift",  "DRIFT",  bip],
+      ["phase",  "PHASE",  pct],
+      ["mod",    "MOD",    bip],
+      ["modf",   "MODF",   pct],
+      ["mix2",   "MIX 2",  pct],
+      ["spread", "SPREAD", pct]
+    ],
+    def: { amtA: 64, amtB: 64, drift: 64, phase: 0, mod: 72, modf: 56, mix2: 70, spread: 40 }
+  },
+  FLTR: {
+    params: [
+      ["cutoff",    "CUTOFF", hz],
+      ["resonance", "RESO",   pct],
+      ["type",      "TYPE",   en("LP4", "LP2", "HP2", "BP2", "NOTCH")],
+      ["env",       "ENV",    bip],
+      ["keytrk",    "KEYTRK", bip],
+      ["drive",     "DRIVE",  pct],
+      ["attack",    "ATK",    pct],
+      ["decay",     "DEC",    pct]
+    ],
+    def: { cutoff: 96, resonance: 44, type: 0, env: 20, keytrk: 64, drive: 30, attack: 12, decay: 62 }
+  },
+  AMP: {
+    params: [
+      ["attack",    "ATTACK",  pct],
+      ["decay",     "DECAY",   pct],
+      ["sustain",   "SUSTAIN", pct],
+      ["release",   "RELEASE", pct],
+      ["volume",    "VOLUME",  pct],
+      ["overdrive", "OVDRV",   pct],
+      ["pan",       "PAN",     bip],
+      ["reverb",    "REVERB",  pct]
+    ],
+    def: { attack: 6, decay: 48, sustain: 96, release: 38, volume: 104, overdrive: 18, pan: 64, reverb: 36 }
+  },
+  LFO: {
+    params: [
+      ["speed", "SPEED", pct],
+      ["shape", "SHAPE", en("SINE", "TRI", "SQR", "SAW", "RND", "EXP")],
+      ["fade",  "FADE",  pct],
+      ["phase", "PHASE", pct],
+      ["depth", "DEPTH", pct],
+      ["dest",  "DEST",  en("PITCH", "CUTOFF", "AMP", "PAN")],
+      ["mult",  "MULT",  en("1X", "2X", "4X", "8X", "1/2", "1/4")],
+      ["trig",  "TRIG",  en("FREE", "TRIG", "HOLD", "ONE")]
+    ],
+    def: { speed: 62, shape: 0, fade: 0, phase: 0, depth: 52, dest: 1, mult: 0, trig: 0 }
+  }
+};
+
+const TRACK_RGB  = ["224,66,54", "228,176,60", "62,160,74", "150,74,206"];
+const DEMO_TRIGS = [[0, 4, 8, 12, 14], [2, 6, 10, 13], [0, 3, 7, 11, 15], []];
+
+const state = {
+  tracks: [],
+  currentTrack: 0,
+  currentPage: "SYN1",
+  selParam: 0,
+  bpm: 120,
+  currentStep: 0,
+  isPlaying: false,
+  isRecordingWav: false,
+  masterVol: 104,
+  fine: false,
+  unison: false,
+  patternName: "SIDEBANDER",
+  bank: "A",
+  patternNo: "01",
+  msg: "",
+  msgUntil: 0,
+  hasRec: false
+};
+
+function makeTracks() {
+  state.tracks = [];
+  for (let t = 0; t < 4; t++) {
+    const params = {};
+    for (const p of PAGES) params[p] = Object.assign({}, PAGE_DEFS[p].def);
+    const trigs = new Array(16).fill(0);
+    for (const s of DEMO_TRIGS[t]) trigs[s] = 1;
+    state.tracks.push({ trigs: trigs, params: params, octave: t * 5 });
+  }
+}
+makeTracks();
+
+/* --------------------------------------------------------------- 2. LAYOUT */
+
+const W = 1000, H = 750;
+
+const G = {
+  screen:   { x: 116, y: 84, w: 360, h: 200 },
+  bezel:    { x: 108, y: 76, w: 376, h: 216 },
+  enc: [
+    { id: "A", x: 566, y: 142 }, { id: "B", x: 673, y: 142 },
+    { id: "C", x: 780, y: 142 }, { id: "D", x: 887, y: 142 },
+    { id: "E", x: 566, y: 248 }, { id: "F", x: 673, y: 248 },
+    { id: "G", x: 780, y: 248 }, { id: "H", x: 887, y: 248 }
+  ],
+  knobs: [
+    { id: "master", x: 57, y: 142, r: 30, cap: "MASTER VOLUME" },
+    { id: "level",  x: 57, y: 248, r: 30, cap: "LEVEL / DATA", sub: "SOUND BROWSER" }
+  ],
+  rec:      { x: 620, y: 74, r: 13 },
+  recPanel: { x: 596, y: 40, w: 206, h: 60 },
+  saveWav:  { x: 700, y: 60, w: 90, h: 30 },
+  footer:   { x: 18, y: 622, w: 964, h: 110 }
+};
+
+const BTNS = [
+  { id: "func",     x: 18,  y: 334, w: 82, h: 40, label: "FUNC",     teal: true },
+  { id: "impexp",   x: 116, y: 334, w: 78, h: 40, label: "IMP/EXP" },
+  { id: "saveprj",  x: 202, y: 334, w: 78, h: 40, label: "SAVE PRJ" },
+  { id: "unison",   x: 288, y: 334, w: 78, h: 40, label: "UNISON" },
+  { id: "taptempo", x: 374, y: 334, w: 78, h: 40, label: "TAP TEMPO" },
+  ...PAGES.map((p, i) => ({ id: "page" + i, x: 500 + i * 86, y: 334, w: 76, h: 40, label: p, page: true })),
+  { id: "midi",   x: 18,  y: 384, w: 82, h: 40, label: "MIDI" },
+  { id: "copy",   x: 116, y: 384, w: 78, h: 40, label: "COPY" },
+  { id: "clear",  x: 202, y: 384, w: 78, h: 40, label: "CLEAR" },
+  { id: "paste",  x: 288, y: 384, w: 78, h: 40, label: "PASTE" },
+  { id: "play",   x: 386, y: 384, w: 58, h: 40, icon: "play" },
+  { id: "stop",   x: 452, y: 384, w: 58, h: 40, icon: "stop" },
+  { id: "yes",    x: 536, y: 384, w: 64, h: 40, label: "YES" },
+  { id: "no",     x: 608, y: 384, w: 64, h: 40, label: "NO" },
+  { id: "left",   x: 700, y: 384, w: 40, h: 40, icon: "left" },
+  { id: "right",  x: 748, y: 384, w: 40, h: 40, icon: "right" },
+  { id: "up",     x: 796, y: 384, w: 40, h: 40, icon: "up" },
+  { id: "down",   x: 844, y: 384, w: 40, h: 40, icon: "down" },
+  { id: "page",   x: 900, y: 384, w: 72, h: 40, label: "PAGE" }
+];
+
+const TRIGS = [];
+for (let i = 0; i < 16; i++) {
+  const row = i < 8 ? 0 : 1, col = i % 8;
+  TRIGS.push({ i: i, x: 94 + col * 81, y: row ? 546 : 468, w: 68, h: 64 });
+}
+const TRACKBTN = [
+  { i: 0, x: 766, y: 472, w: 80, h: 54 },
+  { i: 1, x: 858, y: 472, w: 80, h: 54 },
+  { i: 2, x: 766, y: 552, w: 80, h: 54 },
+  { i: 3, x: 858, y: 552, w: 80, h: 54 }
+];
+
+const UI = '-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif';
+
+/* ------------------------------------------------------------- 3. HELPERS */
+
+function rr(c, x, y, w, h, r) {
+  r = Math.min(r, w * 0.5, h * 0.5);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+/* ---------------------------------------------------------- 4. CANVAS/DPR */
+
+const canvas = document.getElementById("panel");
+const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+
+const bg = document.createElement("canvas");
+const bgc = bg.getContext("2d");
+
+let dpr = 1;
+let needsRedraw = true;
+let oledDirty = true;
+let rafId = 0;
+
+function invalidate() {
+  needsRedraw = true;
+  if (!rafId) rafId = requestAnimationFrame(frame);
+}
+
+function frame() {
+  rafId = 0;
+  if (state.isPlaying) consumeScheduledSteps();
+  if (state.isRecordingWav) needsRedraw = true;         /* REC lamp breathing */
+  if (needsRedraw) { drawUI(); needsRedraw = false; }
+  if (state.isPlaying || state.isRecordingWav) rafId = requestAnimationFrame(frame);
+}
+
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.995;
+  canvas.style.width = (W * s) + "px";
+  canvas.style.height = (H * s) + "px";
+  const d = Math.min(window.devicePixelRatio || 1, 2);  /* cap: A9 fill-rate */
+  if (d !== dpr || bg.width !== Math.round(W * d)) {
+    dpr = d;
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    buildStatic();
+  }
+  invalidate();
+}
+window.addEventListener("resize", resize, { passive: true });
+window.addEventListener("orientationchange", () => setTimeout(resize, 220), { passive: true });
+
+/* =========================================================== STATIC LAYER */
+
+let seed = 1337;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; }
+
+function buildStatic() {
+  bg.width = Math.round(W * dpr);
+  bg.height = Math.round(H * dpr);
+  const c = bgc;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, W, H);
+
+  /* backdrop */
+  c.fillStyle = "#0b0b0d";
+  c.fillRect(0, 0, W, H);
+
+  /* chassis */
+  const chassis = c.createLinearGradient(0, 0, 0, H);
+  chassis.addColorStop(0, "#292a2b");
+  chassis.addColorStop(0.28, "#1f1f21");
+  chassis.addColorStop(0.72, "#191919");
+  chassis.addColorStop(1, "#111112");
+  rr(c, 6, 6, W - 12, H - 12, 18);
+  c.fillStyle = chassis;
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.075)";
+  c.lineWidth = 1.5;
+  c.stroke();
+  rr(c, 11, 11, W - 22, H - 22, 14);
+  c.strokeStyle = "rgba(0,0,0,.55)";
+  c.lineWidth = 2;
+  c.stroke();
+
+  /* brushed-metal streaks (static: zero runtime cost) */
+  seed = 1337;
+  for (let i = 0; i < 54; i++) {
+    const y = 14 + (rnd() % (H - 28));
+    c.fillStyle = i % 2 ? "rgba(255,255,255,.012)" : "rgba(0,0,0,.055)";
+    c.fillRect(12, y, W - 24, 1);
+  }
+
+  /* screws */
+  for (const p of [[26, 26], [974, 26], [26, 724], [974, 724]]) {
+    c.beginPath(); c.arc(p[0], p[1], 7, 0, 6.2832);
+    c.fillStyle = "#2a2a2e"; c.fill();
+    c.strokeStyle = "#0c0c0e"; c.lineWidth = 1; c.stroke();
+    c.beginPath(); c.moveTo(p[0] - 4, p[1]); c.lineTo(p[0] + 4, p[1]);
+    c.strokeStyle = "rgba(0,0,0,.85)"; c.lineWidth = 1.6; c.stroke();
+    c.beginPath(); c.arc(p[0], p[1], 7, Math.PI * 1.1, Math.PI * 1.7);
+    c.strokeStyle = "rgba(255,255,255,.10)"; c.lineWidth = 1; c.stroke();
+  }
+
+  /* top I/O strip */
+  const io = [
+    ["LEFT", 70], ["RIGHT", 132], ["INPUT L", 225], ["INPUT R", 295],
+    ["MIDI IN", 385], ["MIDI OUT", 474], ["MIDI THRU", 590],
+    ["USB", 690], ["DC IN", 790], ["POWER", 884]
+  ];
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.font = "500 8.5px " + UI;
+  c.fillStyle = "#8e8e97";
+  for (const [label, x] of io) c.fillText(label, x, 22);
+  c.font = "500 7.5px " + UI;
+  c.fillStyle = "#65656e";
+  c.fillText("SYNC A", 474, 33);
+  c.fillText("SYNC B", 590, 33);
+  for (const [, x] of io) {
+    c.beginPath(); c.arc(x, 10, 2.6, 0, 6.2832);
+    c.strokeStyle = "rgba(0,0,0,.75)"; c.lineWidth = 2; c.stroke();
+    c.strokeStyle = "rgba(255,255,255,.07)"; c.lineWidth = 1; c.stroke();
+  }
+  c.fillStyle = "rgba(255,255,255,.05)";
+  c.fillRect(20, 45, W - 40, 1);
+
+  /* ELEKTRON wordmark */
+  c.save();
+  c.textAlign = "right";
+  c.textBaseline = "alphabetic";
+  c.font = "700 30px " + UI;
+  c.fillStyle = "#f4f4f6";
+  c.fillText("elektron", 968, 84);
+  c.restore();
+
+  /* WAV recorder housing */
+  const rp = G.recPanel;
+  rr(c, rp.x, rp.y, rp.w, rp.h, 8);
+  c.fillStyle = "#141417";
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.07)";
+  c.lineWidth = 1;
+  c.stroke();
+  c.textAlign = "left";
+  c.textBaseline = "middle";
+  c.font = "600 7.5px " + UI;
+  c.fillStyle = "#82828c";
+  c.fillText("W A V   R E C O R D E R", rp.x + 12, rp.y + 13);
+
+  /* screen bezel + well */
+  const bz = G.bezel, s = G.screen;
+  rr(c, bz.x - 2, bz.y - 2, bz.w + 4, bz.h + 4, 9);
+  c.fillStyle = "#08080a";
+  c.fill();
+  const bez = c.createLinearGradient(0, bz.y, 0, bz.y + bz.h);
+  bez.addColorStop(0, "#131315");
+  bez.addColorStop(1, "#0b0b0d");
+  rr(c, bz.x, bz.y, bz.w, bz.h, 6);
+  c.fillStyle = bez;
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.05)";
+  c.lineWidth = 1;
+  c.stroke();
+  c.fillStyle = "#0a0b00";
+  c.fillRect(s.x, s.y, s.w, s.h);
+  c.strokeStyle = "rgba(255,204,0,.10)";
+  c.strokeRect(s.x - 0.5, s.y - 0.5, s.w + 1, s.h + 1);
+
+  c.textAlign = "left";
+  c.fillStyle = "#a8a8b2";
+  c.font = "500 9.5px " + UI;
+  c.fillText("Polyphonic Digital Synthesizer", 116, 68);
+
+  /* product name */
+  c.textBaseline = "alphabetic";
+  c.fillStyle = "#f2f2f5";
+  c.font = "700 33px " + UI;
+  c.fillText("Digitone", 116, 322);
+
+  /* encoder bodies + letters, big knobs + captions */
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  for (const e of G.enc) {
+    encoderBody(c, e.x, e.y, 27);
+    c.font = "700 12px " + UI;
+    c.fillStyle = "#c6c6d0";
+    c.fillText(e.id, e.x, e.y + 44);
+  }
+  for (const k of G.knobs) {
+    encoderBody(c, k.x, k.y, k.r);
+    c.font = "600 8px " + UI;
+    c.fillStyle = "#8a8a94";
+    c.fillText(k.cap, k.x, k.y + k.r + 16);
+    if (k.sub) {
+      c.font = "500 7.5px " + UI;
+      c.fillStyle = "#67676f";
+      c.fillText(k.sub, k.x, k.y + k.r + 27);
+    }
+  }
+
+  /* button faces */
+  for (const b of BTNS) buttonFace(c, b);
+  for (const t of TRIGS) trigFace(c, t);
+  for (const t of TRACKBTN) trackFace(c, t);
+
+  /* footer plate */
+  const f = G.footer;
+  rr(c, f.x, f.y, f.w, f.h, 12);
+  c.fillStyle = "#141416";
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.055)";
+  c.lineWidth = 1;
+  c.stroke();
+  c.fillStyle = "rgba(255,255,255,.035)";
+  for (const x of [288, 668]) c.fillRect(x, f.y + 18, 1, f.h - 36);
+
+  c.textAlign = "left";
+  c.font = "600 8px " + UI;
+  c.fillStyle = "#63636d";
+  c.fillText("A C T I V E   T R A C K", 38, 644);
+}
+
+function encoderBody(c, x, y, r) {
+  c.beginPath();
+  c.ellipse(x, y + 3, r * 1.02, r * 0.96, 0, 0, 6.2832);
+  c.fillStyle = "rgba(0,0,0,.45)";
+  c.fill();
+
+  const g = c.createRadialGradient(x - r * 0.35, y - r * 0.45, r * 0.15, x, y, r * 1.05);
+  g.addColorStop(0, "#4c4c53");
+  g.addColorStop(0.55, "#33333a");
+  g.addColorStop(1, "#1b1b1f");
+  c.beginPath(); c.arc(x, y, r, 0, 6.2832);
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.85)"; c.lineWidth = 1.5; c.stroke();
+
+  c.beginPath(); c.arc(x, y, r * 0.74, 0, 6.2832);
+  c.strokeStyle = "rgba(0,0,0,.28)"; c.lineWidth = 1; c.stroke();
+
+  c.beginPath(); c.arc(x, y, r - 1.5, Math.PI * 1.12, Math.PI * 1.72);
+  c.strokeStyle = "rgba(255,255,255,.15)"; c.lineWidth = 1.6; c.stroke();
+  c.beginPath(); c.arc(x, y, r - 1.5, Math.PI * 0.12, Math.PI * 0.45);
+  c.strokeStyle = "rgba(255,255,255,.05)"; c.lineWidth = 1.4; c.stroke();
+}
+
+function buttonFace(c, b) {
+  rr(c, b.x, b.y + 1.5, b.w, b.h, 8);
+  c.fillStyle = "rgba(0,0,0,.5)";
+  c.fill();
+  rr(c, b.x, b.y, b.w, b.h, 8);
+  const g = c.createLinearGradient(0, b.y, 0, b.y + b.h);
+  if (b.teal) {
+    g.addColorStop(0, "#4fd6cf"); g.addColorStop(0.5, "#33b9b2"); g.addColorStop(1, "#1f938d");
+  } else {
+    g.addColorStop(0, "#34343b"); g.addColorStop(0.5, "#2a2a31"); g.addColorStop(1, "#1d1d22");
+  }
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
+  c.beginPath();
+  c.moveTo(b.x + 7, b.y + 1.6); c.lineTo(b.x + b.w - 7, b.y + 1.6);
+  c.strokeStyle = b.teal ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.10)";
+  c.lineWidth = 1; c.stroke();
+}
+
+function trigFace(c, t) {
+  rr(c, t.x, t.y + 2, t.w, t.h, 9);
+  c.fillStyle = "rgba(0,0,0,.55)";
+  c.fill();
+  rr(c, t.x, t.y, t.w, t.h, 9);
+  const g = c.createLinearGradient(0, t.y, 0, t.y + t.h);
+  g.addColorStop(0, "#303037"); g.addColorStop(0.55, "#26262b"); g.addColorStop(1, "#1a1a1e");
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
+  c.beginPath();
+  c.moveTo(t.x + 8, t.y + 1.6); c.lineTo(t.x + t.w - 8, t.y + 1.6);
+  c.strokeStyle = "rgba(255,255,255,.09)"; c.lineWidth = 1; c.stroke();
+}
+
+function trackFace(c, t) {
+  rr(c, t.x, t.y + 2, t.w, t.h, 9);
+  c.fillStyle = "rgba(0,0,0,.55)";
+  c.fill();
+  rr(c, t.x, t.y, t.w, t.h, 9);
+  const g = c.createLinearGradient(0, t.y, 0, t.y + t.h);
+  g.addColorStop(0, "#2d2d34");
+  g.addColorStop(1, "#191920");
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
+}
+
+/* ======================================================== OLED (180x100) */
+
+const OW = 180, OH = 100;
+const oled = document.createElement("canvas");
+oled.width = OW; oled.height = OH;
+const octx = oled.getContext("2d");
+
+const FG = "#ffcc00", BG = "#0a0b00";
+
+/* hand-built 5x7 bitmap font ---------------------------------------------- */
+const GL = {
+  " ": [0, 0, 0, 0, 0, 0, 0],
+  "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
+  "2": [14, 17, 1, 2, 4, 8, 31],     "3": [31, 2, 4, 2, 1, 17, 14],
+  "4": [2, 6, 10, 18, 31, 2, 2],     "5": [31, 16, 30, 1, 1, 17, 14],
+  "6": [6, 8, 16, 30, 17, 17, 14],   "7": [31, 1, 2, 4, 8, 8, 8],
+  "8": [14, 17, 17, 14, 17, 17, 14], "9": [14, 17, 17, 15, 1, 2, 12],
+  "A": [14, 17, 17, 31, 17, 17, 17], "B": [30, 17, 17, 30, 17, 17, 30],
+  "C": [14, 17, 16, 16, 16, 17, 14], "D": [28, 18, 17, 17, 17, 18, 28],
+  "E": [31, 16, 16, 30, 16, 16, 31], "F": [31, 16, 16, 30, 16, 16, 16],
+  "G": [14, 17, 16, 23, 17, 17, 15], "H": [17, 17, 17, 31, 17, 17, 17],
+  "I": [14, 4, 4, 4, 4, 4, 14],      "J": [1, 1, 1, 1, 17, 17, 14],
+  "K": [17, 18, 20, 24, 20, 18, 17], "L": [16, 16, 16, 16, 16, 16, 31],
+  "M": [17, 27, 21, 17, 17, 17, 17], "N": [17, 25, 21, 19, 17, 17, 17],
+  "O": [14, 17, 17, 17, 17, 17, 14], "P": [30, 17, 17, 30, 16, 16, 16],
+  "Q": [14, 17, 17, 17, 21, 18, 13], "R": [30, 17, 17, 30, 20, 18, 17],
+  "S": [15, 16, 16, 14, 1, 1, 30],   "T": [31, 4, 4, 4, 4, 4, 4],
+  "U": [17, 17, 17, 17, 17, 17, 14], "V": [17, 17, 17, 17, 17, 10, 4],
+  "W": [17, 17, 17, 21, 21, 27, 17], "X": [17, 17, 10, 4, 10, 17, 17],
+  "Y": [17, 17, 10, 4, 4, 4, 4],     "Z": [31, 1, 2, 4, 8, 16, 31],
+  ".": [0, 0, 0, 0, 0, 12, 12],      ":": [0, 12, 12, 0, 12, 12, 0],
+  "-": [0, 0, 0, 31, 0, 0, 0],       "+": [0, 4, 4, 31, 4, 4, 0],
+  "/": [1, 2, 2, 4, 8, 8, 16],       "%": [25, 26, 2, 4, 8, 11, 19],
+  ">": [8, 4, 2, 1, 2, 4, 8],        "<": [2, 4, 8, 16, 8, 4, 2],
+  "=": [0, 0, 31, 0, 31, 0, 0],      "!": [4, 4, 4, 4, 4, 0, 4],
+  "#": [10, 10, 31, 10, 31, 10, 10], "*": [0, 4, 21, 14, 21, 4, 0],
+  "(": [2, 4, 8, 8, 8, 4, 2],        ")": [8, 4, 2, 2, 2, 4, 8],
+  "[": [14, 8, 8, 8, 8, 8, 14],      "]": [14, 2, 2, 2, 2, 2, 14],
+  "|": [4, 4, 4, 4, 4, 4, 4],        ",": [0, 0, 0, 0, 12, 4, 8]
+};
+
+function pxText(x, y, s, col) {
+  octx.fillStyle = col;
+  for (let i = 0; i < s.length; i++) {
+    const g = GL[s[i]];
+    if (!g) continue;
+    const bx = x + i * 6;
+    for (let r = 0; r < 7; r++) {
+      const bits = g[r];
+      if (!bits) continue;
+      for (let b = 0; b < 5; b++) if (bits & (16 >> b)) octx.fillRect(bx + b, y + r, 1, 1);
+    }
+  }
+}
+const pxW = s => s.length * 6 - 1;
+const pxTextR = (xr, y, s, col) => pxText(xr - pxW(s), y, s, col);
+const pxHLine = (x, y, w, col) => { octx.fillStyle = col; octx.fillRect(x, y, w, 1); };
+const pxVLine = (x, y, h, col) => { octx.fillStyle = col; octx.fillRect(x, y, 1, h); };
+function pxBox(x, y, w, h, col) {
+  pxHLine(x, y, w, col); pxHLine(x, y + h - 1, w, col);
+  pxVLine(x, y, h, col); pxVLine(x + w - 1, y, h, col);
+}
+function pxArrowDown(x, y) {
+  octx.fillStyle = FG;
+  octx.fillRect(x, y - 2, 1, 2);
+  octx.fillRect(x - 2, y, 5, 1);
+  octx.fillRect(x - 1, y - 1, 3, 1);
+}
+function pxArrowRight(x, y) {
+  octx.fillStyle = FG;
+  octx.fillRect(x - 2, y, 2, 1);
+  octx.fillRect(x - 1, y - 1, 1, 3);
+  octx.fillRect(x - 2, y - 1, 1, 3);
+}
+
+/* ------------------------------------------------------- OLED composition */
+
+function renderOLED() {
+  const c = octx;
+  const tr = state.tracks[state.currentTrack];
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page];
+  const pv = tr.params[page];
+
+  c.fillStyle = BG;
+  c.fillRect(0, 0, OW, OH);
+
+  /* --- top bar: bank/pattern · name · tempo */
+  c.fillStyle = FG; c.fillRect(2, 2, 20, 9);
+  pxText(4, 3, state.bank + state.patternNo, BG);
+  pxBox(24, 2, 70, 9, FG);
+  pxText(27, 3, state.patternName, FG);
+  pxTextR(177, 3, state.bpm.toFixed(1), FG);
+  pxHLine(2, 13, 176, FG);
+
+  /* --- page · algorithm · track */
+  c.fillStyle = FG; c.fillRect(2, 15, 27, 9);
+  pxText(4, 16, page, BG);
+  pxText(34, 16, "ALG 1", FG);
+  pxTextR(177, 16, "TRK " + (state.currentTrack + 1), FG);
+
+  /* --- eight parameters, four columns x two rows */
+  const cols = [2, 47, 92, 137];
+  for (let i = 0; i < 8; i++) {
+    const col = cols[i % 4];
+    const ny = i < 4 ? 28 : 48;
+    const key = def.params[i][0];
+    const sel = state.selParam === i;
+    const fg = sel ? BG : FG;
+
+    if (sel) { c.fillStyle = FG; c.fillRect(col - 1, ny - 2, 43, 20); }
+    pxText(col, ny, def.params[i][1], fg);
+    pxText(col, ny + 9, def.params[i][2](pv[key]), fg);
+    c.fillStyle = fg;
+    const bw = Math.round(clamp(pv[key] / MAXV, 0, 1) * 38);
+    if (bw > 0) c.fillRect(col, ny + 18, bw, 2);
+  }
+  pxHLine(2, 70, 176, FG);
+
+  /* --- FM algorithm 1 block scheme */
+  const ax = 2, ay = 72;
+  const blocks = [["A", ax], ["B", ax + 22], ["C", ax + 44]];
+  for (const [lbl, bx] of blocks) {
+    pxBox(bx, ay, 12, 9, FG);
+    pxText(bx + 4, ay + 1, lbl, FG);
+  }
+  c.fillStyle = FG;
+  c.fillRect(ax + 13, ay + 4, 8, 1); pxArrowRight(ax + 21, ay + 4);
+  c.fillRect(ax + 35, ay + 4, 8, 1); pxArrowRight(ax + 43, ay + 4);
+  c.fillRect(ax + 50, ay + 10, 1, 3); pxArrowDown(ax + 50, ay + 14);
+  pxText(ax, 84, "ALG 1", FG);
+  pxText(ax + 62, 84, "OUT", FG);
+
+  /* --- page-dependent graphic */
+  drawOLEDGraphic(84, 74, 94, 14);
+
+  /* --- 16 step strip */
+  pxHLine(2, 91, 176, FG);
+  for (let i = 0; i < 16; i++) {
+    const x = 3 + i * 7;
+    if (tr.trigs[i]) { c.fillStyle = FG; c.fillRect(x, 93, 6, 5); }
+    else pxBox(x, 93, 6, 5, FG);
+    if (state.isPlaying && state.currentStep === i) {
+      c.fillStyle = FG;
+      c.fillRect(x - 1, 92, 8, 1);
+      c.fillRect(x - 1, 98, 8, 1);
+    }
+  }
+  pxText(120, 93, "1/16", FG);
+  pxTextR(177, 93, state.isPlaying ? "PLAY" : "STOP", FG);
+}
+
+function drawOLEDGraphic(x, y, w, h) {
+  const page = state.currentPage;
+  const p = state.tracks[state.currentTrack].params[page];
+  const mid = y + h / 2;
+  octx.strokeStyle = FG;
+  octx.lineWidth = 1;
+  octx.fillStyle = FG;
+
+  if (page === "FLTR") {
+    /* log-frequency low-pass response with a resonance bump */
+    const fc = 0.08 + (p.cutoff / MAXV) * 0.86;
+    const res = p.resonance / MAXV;
+    const peak = 1 + res * 0.85;
+    octx.beginPath();
+    for (let i = 0; i <= w; i++) {
+      const t = i / w;
+      const g = 1 / Math.sqrt(1 + Math.pow(t / fc, 8));
+      const bump = res * 0.9 * Math.exp(-Math.pow((t - fc) * 22, 2));
+      const v = Math.min(peak, g * (1 + bump));
+      const yy = y + 1 + (1 - v / peak) * (h - 2);
+      i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+    }
+    octx.stroke();
+    octx.fillRect(x, y + h + 1, w + 1, 1);
+    return;
+  }
+
+  if (page === "AMP") {
+    const a = 0.03 + (p.attack / MAXV) * 0.16;
+    const d = 0.10 + (p.decay / MAXV) * 0.22;
+    const s = p.sustain / MAXV;
+    const r = 0.12 + (p.release / MAXV) * 0.30;
+    const xs = [0, a, a + d, a + d + 0.22, a + d + 0.22 + r];
+    const ys = [y + h, y + 1, y + h - s * h, y + h - s * h, y + h];
+    octx.beginPath();
+    for (let i = 0; i < xs.length; i++) {
+      const px = x + (xs[i] / xs[xs.length - 1]) * w;
+      i ? octx.lineTo(px, ys[i]) : octx.moveTo(px, ys[i]);
+    }
+    octx.stroke();
+    return;
+  }
+
+  if (page === "LFO") {
+    const shape = Math.round(p.shape / MAXV * 5);
+    const cyc = 1 + Math.round(p.speed / MAXV * 3);
+    octx.beginPath();
+    for (let i = 0; i <= w; i++) {
+      const t = i / w, ph = (t * cyc) % 1;
+      let v;
+      if (shape === 2) v = ph < 0.5 ? 1 : -1;
+      else if (shape === 3) v = 1 - 2 * ph;
+      else if (shape === 1) v = 1 - 4 * Math.abs(ph - 0.5);
+      else if (shape === 5) v = (ph < 0.5 ? 1 : -1) * (1 - ph);
+      else v = Math.sin(ph * Math.PI * 2);
+      const yy = mid - v * (h / 2 - 1);
+      i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+    }
+    octx.stroke();
+    return;
+  }
+
+  /* SYN1 / SYN2 — carrier wave, cycle count follows the harmonic amount */
+  const cyc = 1 + Math.round(p.harm / MAXV * 3);
+  octx.beginPath();
+  for (let i = 0; i <= w; i++) {
+    const v = Math.sin((i / w) * Math.PI * 2 * cyc);
+    const yy = mid - v * (h / 2 - 1);
+    i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+  }
+  octx.stroke();
+}
+
+/* ============================================================ DYNAMIC UI */
+
+function drawUI() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(bg, 0, 0);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  drawScreen();
+  drawEncoders();
+  drawBigKnobs();
+  drawButtons();
+  drawTrigs();
+  drawTrackButtons();
+  drawPageLeds();
+  drawRecorder();
+  drawFooter();
+  drawPressed();
+}
+
+function drawScreen() {
+  if (oledDirty) { renderOLED(); oledDirty = false; }
+  const s = G.screen;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(oled, s.x, s.y, s.w, s.h);
+  ctx.imageSmoothingEnabled = true;
+}
+
+/* --- encoders A..H ------------------------------------------------------- */
+const A0 = -Math.PI / 2 - Math.PI * 0.75;
+const SPAN = Math.PI * 1.5;
+
+function ring(x, y, r, value, hot) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, A0, A0 + SPAN);
+  ctx.strokeStyle = "rgba(255,255,255,.07)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  const ang = A0 + clamp(value / MAXV, 0, 1) * SPAN;
+  if (value > 0) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, A0, ang);
+    ctx.strokeStyle = hot ? "#ffbb55" : "rgba(255,204,0,.42)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + Math.cos(ang) * (r - 20), y + Math.sin(ang) * (r - 20));
+  ctx.lineTo(x + Math.cos(ang) * (r - 8), y + Math.sin(ang) * (r - 8));
+  ctx.strokeStyle = hot ? "#ffe0a8" : "#e6e6ec";
+  ctx.lineWidth = 3.4;
+  ctx.lineCap = "round";
+  ctx.stroke();
+  ctx.lineCap = "butt";
+}
+
+function drawEncoders() {
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page];
+  const pv = state.tracks[state.currentTrack].params[page];
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (let i = 0; i < 8; i++) {
+    const e = G.enc[i];
+    const val = pv[def.params[i][0]];
+    const sel = state.selParam === i;
+    ring(e.x, e.y, 32, val, sel);
+    ctx.font = "600 9px " + UI;
+    ctx.fillStyle = sel ? "#ffbb55" : "#77777f";
+    ctx.fillText(def.params[i][2](val), e.x, e.y + 57);
+  }
+}
+
+/* --- master volume + level/data ------------------------------------------ */
+function drawBigKnobs() {
+  ring(G.knobs[0].x, G.knobs[0].y, 35, state.masterVol, PRESSED.has("knob:master"));
+  ring(G.knobs[1].x, G.knobs[1].y, 35, currentPageValue(state.selParam), PRESSED.has("knob:level"));
+}
+
+/* --- rectangular buttons ------------------------------------------------- */
+function drawButtons() {
+  for (const b of BTNS) {
+    const on = buttonActive(b.id);
+    if (b.page) {
+      if (on) goldFace(b);
+      label(b, on ? "#1e1405" : "#d5d5dd", "600 11px ");
+      ctx.fillStyle = on ? "rgba(40,26,6,.6)" : "rgba(255,204,0,.45)";
+      ctx.fillRect(b.x + b.w / 2 - 3, b.y + b.h - 8, 6, 2);
+    } else if (b.icon) {
+      if (on) {
+        rr(ctx, b.x, b.y, b.w, b.h, 8);
+        ctx.fillStyle = "rgba(255,176,64,.18)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,196,100,.55)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      drawIcon(b, on);
+    } else if (b.teal) {
+      /* FUNC is a latch, not a lit key: teal face + white ring while engaged */
+      label(b, "#04231f", "700 12px ");
+      if (state.fine) {
+        rr(ctx, b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3, 6.5);
+        ctx.strokeStyle = "rgba(255,255,255,.92)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    } else if (on) {
+      goldFace(b);
+      label(b, "#1e1405", "600 10px ");
+    } else {
+      label(b, "#dcdce3", "600 10px ");
+    }
+  }
+}
+
+function goldFace(b) {
+  rr(ctx, b.x, b.y, b.w, b.h, 8);
+  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  g.addColorStop(0, "#f4c469");
+  g.addColorStop(0.5, "#d9a03c");
+  g.addColorStop(1, "#b1771f");
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,228,166,.7)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+function label(b, color, font) {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = font + UI;
+  ctx.fillStyle = color;
+  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+}
+
+function drawIcon(b, on) {
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  ctx.fillStyle = on ? "#ffd479" : "#cfcfd8";
+  if (b.icon === "play") {
+    ctx.beginPath();
+    ctx.moveTo(cx - 5, cy - 7); ctx.lineTo(cx + 7, cy); ctx.lineTo(cx - 5, cy + 7);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "stop") {
+    ctx.fillRect(cx - 6, cy - 6, 12, 12);
+  } else if (b.icon === "up") {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 6); ctx.lineTo(cx + 6, cy + 4); ctx.lineTo(cx - 6, cy + 4);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "down") {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 6); ctx.lineTo(cx + 6, cy - 4); ctx.lineTo(cx - 6, cy - 4);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "left") {
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, cy); ctx.lineTo(cx + 4, cy - 6); ctx.lineTo(cx + 4, cy + 6);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "right") {
+    ctx.beginPath();
+    ctx.moveTo(cx + 6, cy); ctx.lineTo(cx - 4, cy - 6); ctx.lineTo(cx - 4, cy + 6);
+    ctx.closePath(); ctx.fill();
+  }
+}
+
+function buttonActive(id) {
+  if (id === "play") return state.isPlaying;
+  if (id === "func") return state.fine;
+  if (id === "unison") return state.unison;
+  if (id.startsWith("page")) return PAGES[+id.slice(4)] === state.currentPage;
+  return false;
+}
+
+/* --- 16 trigs ------------------------------------------------------------ */
+function drawTrigs() {
+  const tr = state.tracks[state.currentTrack];
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  for (const t of TRIGS) {
+    const on = tr.trigs[t.i] === 1;
+    const cur = state.isPlaying && state.currentStep === t.i;
+    const cx = t.x + t.w / 2, cy = t.y + t.h / 2;
+
+    if (on) {
+      rr(ctx, t.x, t.y, t.w, t.h, 9);
+      const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
+      g.addColorStop(0, "rgba(255,180,108,1)");
+      g.addColorStop(0.45, "rgba(255,140,58,1)");
+      g.addColorStop(1, "rgba(209,82,15,1)");
+      ctx.fillStyle = g;
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,208,150,.6)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    ctx.font = "700 17px " + UI;
+    ctx.fillStyle = on ? "#2b1200" : "rgba(196,196,206,.85)";
+    ctx.fillText(String(t.i + 1), cx, cy + 1);
+
+    ctx.beginPath();
+    ctx.arc(t.x + 10, t.y + 10, 2.6, 0, 6.2832);
+    ctx.fillStyle = on ? "rgba(70,26,0,.9)" : "rgba(255,255,255,.14)";
+    ctx.fill();
+
+    if (cur) {
+      rr(ctx, t.x - 2, t.y - 2, t.w + 4, t.h + 4, 11);
+      ctx.strokeStyle = "rgba(255,255,255,.9)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+}
+
+/* --- T1..T4 -------------------------------------------------------------- */
+function drawTrackButtons() {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const t of TRACKBTN) {
+    const on = state.currentTrack === t.i;
+    const rgb = TRACK_RGB[t.i];
+
+    if (on) {
+      rr(ctx, t.x, t.y, t.w, t.h, 9);
+      const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
+      g.addColorStop(0, "rgba(" + rgb + ",1)");
+      g.addColorStop(0.6, "rgba(" + rgb + ",.82)");
+      g.addColorStop(1, "rgba(" + rgb + ",.55)");
+      ctx.fillStyle = g;
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,.55)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    } else {
+      rr(ctx, t.x + 1, t.y + 1, t.w - 2, t.h - 2, 8);
+      ctx.fillStyle = "rgba(" + rgb + ",.10)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(" + rgb + ",.35)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    ctx.font = "700 18px " + UI;
+    ctx.fillStyle = on ? "rgba(255,255,255,.98)" : "rgba(" + rgb + ",.85)";
+    ctx.fillText("T" + (t.i + 1), t.x + t.w / 2, t.y + t.h / 2 - 5);
+
+    ctx.font = "600 8px " + UI;
+    ctx.fillStyle = on ? "rgba(255,255,255,.65)" : "rgba(255,255,255,.28)";
+    ctx.fillText("MUTE", t.x + t.w / 2, t.y + t.h - 13);
+  }
+}
+
+/* --- pattern page LEDs --------------------------------------------------- */
+function drawPageLeds() {
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = "500 8.5px " + UI;
+  for (let i = 0; i < 4; i++) {
+    const x = 806 + i * 46, y = 448;
+    ctx.beginPath();
+    ctx.arc(x, y, 3.4, 0, 6.2832);
+    ctx.fillStyle = i === 0 ? "#ffb02e" : "#33333a";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,.6)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = i === 0 ? "#c9c9d2" : "#6e6e78";
+    ctx.fillText((i + 1) + ":4", x + 9, y + 0.5);
+  }
+}
+
+/* --- WAV recorder (REC + SAVE WAV) --------------------------------------- */
+function drawRecorder() {
+  const r = G.rec;
+  const t = performance.now();
+
+  ctx.beginPath();
+  ctx.arc(r.x, r.y, r.r + 2, 0, 6.2832);
+  ctx.fillStyle = "#191215";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  if (state.isRecordingWav) {
+    const pulse = 0.55 + 0.45 * Math.abs(Math.sin(t / 260));
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r + 6, 0, 6.2832);
+    ctx.strokeStyle = "rgba(255,60,44," + (0.28 * pulse).toFixed(3) + ")";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, 6.2832);
+    ctx.fillStyle = "rgba(255,52,36," + pulse.toFixed(3) + ")";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(r.x - 3.5, r.y - 4, 3.2, 0, 6.2832);
+    ctx.fillStyle = "rgba(255,255,255,.28)";
+    ctx.fill();
+  } else {
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, 6.2832);
+    const g = ctx.createRadialGradient(r.x - 4, r.y - 5, 2, r.x, r.y, r.r);
+    g.addColorStop(0, "#74251f");
+    g.addColorStop(1, "#3a1210");
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,90,74,.5)";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  }
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = "700 9.5px " + UI;
+  ctx.fillStyle = state.isRecordingWav ? "#ff5a48" : "#c8c8d0";
+  ctx.fillText("REC", r.x + 19, r.y - 4);
+  ctx.font = "500 8px " + UI;
+  ctx.fillStyle = state.isRecordingWav ? "#ff8574" : "#6f6f79";
+  ctx.fillText(recTime(), r.x + 19, r.y + 9);
+
+  const s = G.saveWav;
+  rr(ctx, s.x, s.y, s.w, s.h, 7);
+  const sg = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+  sg.addColorStop(0, state.hasRec ? "#3d4137" : "#2c2c32");
+  sg.addColorStop(1, state.hasRec ? "#282b24" : "#1e1e22");
+  ctx.fillStyle = sg;
+  ctx.fill();
+  ctx.strokeStyle = state.hasRec ? "rgba(255,204,0,.55)" : "rgba(255,255,255,.10)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.font = "700 8.5px " + UI;
+  ctx.fillStyle = state.hasRec ? "#ffd166" : "#a9a9b3";
+  ctx.fillText("SAVE WAV", s.x + s.w / 2, s.y + s.h / 2 + 0.5);
+}
+
+/* --- status plate -------------------------------------------------------- */
+function drawFooter() {
+  const tr = state.tracks[state.currentTrack];
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page];
+  const key = def.params[state.selParam][0];
+  const val = tr.params[page][key];
+  const rgb = TRACK_RGB[state.currentTrack];
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  ctx.beginPath();
+  ctx.arc(33, 663, 4.5, 0, 6.2832);
+  ctx.fillStyle = "rgba(" + rgb + ",1)";
+  ctx.fill();
+
+  ctx.font = "700 17px " + UI;
+  ctx.fillStyle = "#f1f1f5";
+  ctx.fillText("TRACK " + (state.currentTrack + 1), 44, 663);
+
+  ctx.font = "600 9.5px " + UI;
+  ctx.fillStyle = "#8b8b95";
+  ctx.fillText(state.bank + state.patternNo + "  " + state.patternName, 44, 683);
+
+  ctx.font = "600 9px " + UI;
+  ctx.fillStyle = "#77777f";
+  ctx.fillText(page + "  /  " + def.params[state.selParam][1], 44, 703);
+
+  ctx.textAlign = "right";
+  ctx.font = "700 11px " + UI;
+  ctx.fillStyle = "#ffcc00";
+  ctx.fillText(def.params[state.selParam][2](val), 250, 703);
+
+  rr(ctx, 44, 712, 206, 4, 2);
+  ctx.fillStyle = "#26262b";
+  ctx.fill();
+  rr(ctx, 44, 712, Math.max(2, 206 * val / MAXV), 4, 2);
+  ctx.fillStyle = "#d9a03c";
+  ctx.fill();
+
+  ctx.textAlign = "left";
+  ctx.font = "500 9px " + UI;
+  ctx.fillStyle = "#63636d";
+  ctx.fillText("TAP TRIG 1\u201316 TO TOGGLE STEPS", 300, 652);
+  ctx.fillText("DRAG ENCODERS A\u2013H UP / DOWN TO EDIT", 300, 668);
+  ctx.fillText("FUNC = FINE \u00b7 PAGE / \u25c0 \u25b6 = PARAM PAGE", 300, 684);
+
+  ctx.textAlign = "right";
+  ctx.font = "700 26px " + UI;
+  ctx.fillStyle = "#f4f4f8";
+  ctx.fillText(state.bpm.toFixed(1), 776, 664);
+  ctx.textAlign = "left";
+  ctx.font = "600 9px " + UI;
+  ctx.fillStyle = "#6e6e78";
+  ctx.fillText("BPM", 784, 668);
+
+  ctx.beginPath();
+  ctx.arc(700, 700, 4, 0, 6.2832);
+  ctx.fillStyle = state.isPlaying ? "#ff9f43" : "#3a3a42";
+  ctx.fill();
+  ctx.font = "600 9.5px " + UI;
+  ctx.fillStyle = state.isPlaying ? "#ffb45e" : "#77777f";
+  ctx.fillText(state.isPlaying ? "PLAYING" : "STOPPED", 712, 700);
+
+  ctx.textAlign = "right";
+  ctx.fillStyle = state.isRecordingWav ? "#ff5a48" : (state.hasRec ? "#b9a25a" : "#5f5f69");
+  ctx.font = "600 9.5px " + UI;
+  ctx.fillText(state.isRecordingWav ? "REC " + recTime() : (state.hasRec ? "WAV READY" : "NO WAV"), 966, 700);
+
+  const now = performance.now();
+  if (state.msg && now < state.msgUntil) {
+    const a = Math.min(1, (state.msgUntil - now) / 300);
+    ctx.textAlign = "center";
+    ctx.font = "700 11px " + UI;
+    ctx.fillStyle = "rgba(255,204,0," + a.toFixed(2) + ")";
+    ctx.fillText(state.msg, 520, 718);
+  }
+}
+
+/* --- press feedback ------------------------------------------------------ */
+const PRESSED = new Set();
+function drawPressed() {
+  if (!PRESSED.size) return;
+  for (const b of BTNS) if (PRESSED.has("btn:" + b.id)) shadeRect(b.x, b.y + 1, b.w, b.h - 1, 8);
+  for (const t of TRIGS) if (PRESSED.has("trig:" + t.i)) shadeRect(t.x, t.y + 1, t.w, t.h - 1, 9);
+  for (const t of TRACKBTN) if (PRESSED.has("track:" + t.i)) shadeRect(t.x, t.y + 1, t.w, t.h - 1, 9);
+  const s = G.saveWav;
+  if (PRESSED.has("btn:savewav")) shadeRect(s.x, s.y, s.w, s.h, 7);
+  if (PRESSED.has("btn:rec")) {
+    ctx.beginPath();
+    ctx.arc(G.rec.x, G.rec.y, G.rec.r + 2, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.fill();
+  }
+  for (let i = 0; i < 8; i++) {
+    if (PRESSED.has("enc:" + i)) {
+      const e = G.enc[i];
+      ctx.beginPath(); ctx.arc(e.x, e.y, 27, 0, 6.2832);
+      ctx.fillStyle = "rgba(0,0,0,.22)"; ctx.fill();
+    }
+  }
+}
+function shadeRect(x, y, w, h, r) {
+  rr(ctx, x, y, w, h, r);
+  ctx.fillStyle = "rgba(0,0,0,.30)";
+  ctx.fill();
+}
+
+/* ============================================================== 6. INPUT */
+
+function canvasPoint(cx, cy) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (cx - r.left) / r.width * W, y: (cy - r.top) / r.height * H };
+}
+
+const HITS = [];
+function buildHits() {
+  HITS.length = 0;
+  for (let i = 0; i < 8; i++) HITS.push({ k: "enc:" + i, t: "enc", i: i, x: G.enc[i].x, y: G.enc[i].y, r: 38 });
+  for (const k of G.knobs) HITS.push({ k: "knob:" + k.id, t: "knob", id: k.id, x: k.x, y: k.y, r: 40 });
+  for (const t of TRIGS) HITS.push({ k: "trig:" + t.i, t: "trig", i: t.i, x: t.x, y: t.y, w: t.w, h: t.h });
+  for (const t of TRACKBTN) HITS.push({ k: "track:" + t.i, t: "track", i: t.i, x: t.x, y: t.y, w: t.w, h: t.h });
+  for (const b of BTNS) HITS.push({ k: "btn:" + b.id, t: "btn", id: b.id, x: b.x, y: b.y, w: b.w, h: b.h });
+  const s = G.saveWav;
+  HITS.push({ k: "btn:savewav", t: "btn", id: "savewav", x: s.x, y: s.y, w: s.w, h: s.h });
+  HITS.push({ k: "btn:rec", t: "rec", id: "rec", x: G.rec.x, y: G.rec.y, r: G.rec.r + 10 });
+}
+buildHits();
+
+function hitTest(x, y) {
+  for (let i = HITS.length - 1; i >= 0; i--) {
+    const h = HITS[i];
+    if (h.w) {
+      if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h;
+    } else {
+      const dx = x - h.x, dy = y - h.y;
+      if (dx * dx + dy * dy <= h.r * h.r) return h;
+    }
+  }
+  return null;
+}
+
+const drags = new Map();                 /* touch identifier -> drag state */
+
+function currentPageValue(i) {
+  const d = PAGE_DEFS[state.currentPage];
+  return state.tracks[state.currentTrack].params[state.currentPage][d.params[i][0]];
+}
+function setParam(i, v) {
+  const d = PAGE_DEFS[state.currentPage];
+  state.tracks[state.currentTrack].params[state.currentPage][d.params[i][0]] = clamp(Math.round(v), 0, MAXV);
+  state.selParam = i;
+  oledDirty = true;
+  invalidate();
+}
+
+function pointerDown(px, py, id) {
+  const hit = hitTest(px, py);
+  if (!hit) return;
+  PRESSED.add(hit.k);
+
+  if (hit.t === "enc") {
+    state.selParam = hit.i;
+    drags.set(id, { kind: "enc", i: hit.i, y0: py, v0: currentPageValue(hit.i), k: hit.k });
+    oledDirty = true;
+  } else if (hit.t === "knob") {
+    const base = hit.id === "master" ? state.masterVol : currentPageValue(state.selParam);
+    drags.set(id, { kind: "knob", knob: hit.id, y0: py, v0: base, k: hit.k });
+  } else if (hit.t === "trig") {
+    const tr = state.tracks[state.currentTrack];
+    tr.trigs[hit.i] = tr.trigs[hit.i] ? 0 : 1;
+    oledDirty = true;
+    if (tr.trigs[hit.i]) previewVoice(state.currentTrack, hit.i);
+    PRESSED.delete(hit.k);
+  } else if (hit.t === "track") {
+    selectTrack(hit.i);
+    PRESSED.delete(hit.k);
+  } else if (hit.t === "btn" || hit.t === "rec") {
+    pressButton(hit.id);
+    setTimeout(() => { PRESSED.delete(hit.k); invalidate(); }, 110);
+  }
+  invalidate();
+}
+
+function pointerMove(px, py, id) {
+  const d = drags.get(id);
+  if (!d) return;
+  const sens = d.kind === "knob" ? 0.42 : (state.fine ? 0.20 : 0.62);
+  const v = clamp(d.v0 + (d.y0 - py) * sens, 0, MAXV);
+  if (d.kind === "enc") {
+    setParam(d.i, v);
+  } else if (d.knob === "master") {
+    state.masterVol = Math.round(v);
+    if (masterGain) masterGain.gain.value = gainFromVolume();
+    invalidate();
+  } else {
+    setParam(state.selParam, v);
+  }
+}
+
+function pointerUp(id) {
+  const d = drags.get(id);
+  if (!d) return;
+  PRESSED.delete(d.k);
+  drags.delete(id);
+  oledDirty = true;
+  invalidate();
+}
+
+/* touch ------------------------------------------------------------------- */
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault();
+  audioUnlock();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    const p = canvasPoint(t.clientX, t.clientY);
+    pointerDown(p.x, p.y, t.identifier);
+  }
+}, { passive: false });
+
+canvas.addEventListener("touchmove", e => {
+  e.preventDefault();
+  for (let i = 0; i < e.changedTouches.length; i++) {
+    const t = e.changedTouches[i];
+    const p = canvasPoint(t.clientX, t.clientY);
+    pointerMove(p.x, p.y, t.identifier);
+  }
+}, { passive: false });
+
+function endTouch(e) {
+  for (let i = 0; i < e.changedTouches.length; i++) pointerUp(e.changedTouches[i].identifier);
+}
+canvas.addEventListener("touchend", endTouch, { passive: true });
+canvas.addEventListener("touchcancel", endTouch, { passive: true });
+
+/* mouse (desktop testing) -------------------------------------------------- */
+let mouseDown = false;
+canvas.addEventListener("mousedown", e => {
+  e.preventDefault();
+  audioUnlock();
+  const p = canvasPoint(e.clientX, e.clientY);
+  mouseDown = true;
+  pointerDown(p.x, p.y, "mouse");
+});
+window.addEventListener("mousemove", e => {
+  if (!mouseDown) return;
+  const p = canvasPoint(e.clientX, e.clientY);
+  pointerMove(p.x, p.y, "mouse");
+});
+window.addEventListener("mouseup", () => {
+  if (!mouseDown) return;
+  mouseDown = false;
+  pointerUp("mouse");
+});
+
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("gesturestart", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+
+/* =========================================================== 7. ACTIONS */
+
+function selectTrack(i) {
+  state.currentTrack = i;
+  state.selParam = 0;
+  oledDirty = true;
+  invalidate();
+}
+
+function nextPage(dir) {
+  const i = PAGES.indexOf(state.currentPage);
+  state.currentPage = PAGES[(i + dir + PAGES.length) % PAGES.length];
+  state.selParam = 0;
+  oledDirty = true;
+  invalidate();
+}
+
+function nudge(dir) {
+  setParam(state.selParam, currentPageValue(state.selParam) + dir);
+}
+
+let clip = null;
+function copyTrack() {
+  const t = state.tracks[state.currentTrack];
+  clip = { trigs: t.trigs.slice(), params: JSON.parse(JSON.stringify(t.params)) };
+  toast("TRACK " + (state.currentTrack + 1) + " COPIED");
+}
+function pasteTrack() {
+  if (!clip) { toast("NOTHING TO PASTE"); return; }
+  const t = state.tracks[state.currentTrack];
+  t.trigs = clip.trigs.slice();
+  t.params = JSON.parse(JSON.stringify(clip.params));
+  state.selParam = 0;
+  oledDirty = true;
+  invalidate();
+  toast("PASTED TO TRACK " + (state.currentTrack + 1));
+}
+function clearTrack() {
+  state.tracks[state.currentTrack].trigs.fill(0);
+  oledDirty = true;
+  invalidate();
+  toast("TRACK " + (state.currentTrack + 1) + " CLEARED");
+}
+
+function pressButton(id) {
+  switch (id) {
+    case "play": case "yes": startPlay(); break;
+    case "stop": case "no": stopPlay(); break;
+    case "copy": copyTrack(); break;
+    case "clear": clearTrack(); break;
+    case "paste": pasteTrack(); break;
+    case "saveprj": saveProject(); break;
+    case "impexp": loadProject(false); break;
+    case "unison": state.unison = !state.unison; toast("UNISON " + (state.unison ? "ON" : "OFF")); break;
+    case "func": state.fine = !state.fine; toast(state.fine ? "FINE EDIT" : "NORMAL EDIT"); break;
+    case "taptempo": tapTempo(); break;
+    case "page": nextPage(1); break;
+    case "left": nextPage(-1); break;
+    case "right": nextPage(1); break;
+    case "up": nudge(1); break;
+    case "down": nudge(-1); break;
+    case "midi": toast("MIDI CONFIG"); break;
+    case "savewav": saveWav(); break;
+    case "rec": toggleRec(); break;
+    default:
+      if (id.indexOf("page") === 0) {
+        state.currentPage = PAGES[+id.slice(4)];
+        state.selParam = 0;
+        oledDirty = true;
+      }
+  }
+  invalidate();
+}
+
+let lastTap = 0;
+const tapGaps = [];
+function tapTempo() {
+  const now = performance.now();
+  if (now - lastTap > 2000) tapGaps.length = 0;
+  if (lastTap) tapGaps.push(now - lastTap);
+  lastTap = now;
+  if (tapGaps.length) {
+    const avg = tapGaps.reduce((a, b) => a + b, 0) / tapGaps.length;
+    const bpm = clamp(Math.round(600000 / avg) / 10, 30, 300);
+    state.bpm = bpm;
+    oledDirty = true;
+    toast("BPM " + bpm.toFixed(1));
+  }
+}
+
+function toast(msg) {
+  state.msg = msg;
+  state.msgUntil = performance.now() + 1700;
+  invalidate();
+  clearTimeout(toast.t);
+  toast.t = setTimeout(invalidate, 1780);
+}
+
+/* persistence ------------------------------------------------------------- */
+const STORE_KEY = "digitone.panel.v1";
+function saveProject() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify({
+      tracks: state.tracks.map(t => ({ trigs: t.trigs, params: t.params })),
+      bpm: state.bpm, masterVol: state.masterVol
+    }));
+    toast("PROJECT SAVED");
+  } catch (err) { toast("SAVE FAILED"); }
+}
+function loadProject(silent) {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) { if (!silent) toast("NO PROJECT FOUND"); return false; }
+    const d = JSON.parse(raw);
+    if (d.tracks && d.tracks.length === 4) {
+      for (let i = 0; i < 4; i++) {
+        const src = d.tracks[i];
+        const trigs = new Array(16).fill(0);
+        (src.trigs || []).forEach((v, k) => { if (k < 16) trigs[k] = v ? 1 : 0; });
+        state.tracks[i].trigs = trigs;
+        for (const p of PAGES) if (src.params && src.params[p]) Object.assign(state.tracks[i].params[p], src.params[p]);
+      }
+      if (typeof d.bpm === "number") state.bpm = d.bpm;
+      if (typeof d.masterVol === "number") state.masterVol = d.masterVol;
+    }
+    oledDirty = true;
+    invalidate();
+    if (!silent) toast("PROJECT LOADED");
+    return true;
+  } catch (err) {
+    if (!silent) toast("LOAD FAILED");
+    return false;
+  }
+}
+
+/* ======================================================= 8. AUDIO ENGINE */
+
+let actx = null, masterGain = null, recNode = null;
+let recBufs = [], recLen = 0, recStart = 0;
+
+function gainFromVolume() { return Math.pow(state.masterVol / MAXV, 1.5) * 0.55; }
+
+function audioUnlock() {
+  try {
+    if (!actx) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      actx = new Ctor();
+      masterGain = actx.createGain();
+      masterGain.gain.value = gainFromVolume();
+      masterGain.connect(actx.destination);
+
+      /* PCM tap for the WAV recorder (ScriptProcessor: universally available
+         on iOS 16, and it only fires ~11x per second) */
+      if (actx.createScriptProcessor) {
+        recNode = actx.createScriptProcessor(4096, 1, 1);
+        recNode.onaudioprocess = ev => {
+          if (!state.isRecordingWav) return;
+          const d = ev.inputBuffer.getChannelData(0);
+          recBufs.push(new Float32Array(d));
+          recLen += d.length;
+          if (recLen > actx.sampleRate * 180) stopRec(true);   /* 3 minute cap */
+        };
+        masterGain.connect(recNode);
+        const mute = actx.createGain();
+        mute.gain.value = 0;
+        recNode.connect(mute);
+        mute.connect(actx.destination);
+      }
+    }
+    if (actx.state === "suspended") actx.resume();
+  } catch (err) { actx = null; }
+}
+
+function voice(trackIdx, step, when) {
+  if (!actx) return;
+  const tr = state.tracks[trackIdx];
+  const syn = tr.params.SYN1, flt = tr.params.FLTR, amp = tr.params.AMP;
+
+  const scale = [0, 3, 5, 7, 10, 12, 15, 17];
+  const f = 55 * Math.pow(2, (scale[step % 8] + tr.octave) / 12);
+  const rat = 0.5 + (syn.ratioA / MAXV) * 7.5;
+  const idx = (syn.feedback / MAXV) * 5 + 0.2;
+
+  const car = actx.createOscillator();
+  const mod = actx.createOscillator();
+  const modGain = actx.createGain();
+  const vca = actx.createGain();
+  const lp = actx.createBiquadFilter();
+
+  car.type = "sine"; mod.type = "sine";
+  car.frequency.value = f * (0.5 + (syn.ratioC / MAXV) * 1.5);
+  mod.frequency.value = car.frequency.value * rat;
+  modGain.gain.value = car.frequency.value * idx;
+
+  lp.type = "lowpass";
+  lp.frequency.value = Math.min(16000, 80 * Math.pow(2, (flt.cutoff / MAXV) * 7.4));
+  lp.Q.value = 0.4 + (flt.resonance / MAXV) * 14;
+
+  mod.connect(modGain);
+  modGain.connect(car.frequency);
+  car.connect(lp);
+  lp.connect(vca);
+  vca.connect(masterGain);
+
+  const t = when || actx.currentTime + 0.005;
+  const peak = 0.16 * (amp.volume / MAXV) * (state.unison ? 0.8 : 1);
+  const a = 0.004 + Math.pow(amp.attack / MAXV, 2) * 0.5;
+  const d = 0.03 + (amp.decay / MAXV) * 1.1;
+  const s = Math.max(0.001, amp.sustain / MAXV);
+  const hold = 0.12;
+  const r = 0.03 + (amp.release / MAXV) * 1.0;
+  const end = t + a + d + hold + r;
+
+  vca.gain.setValueAtTime(0.0001, t);
+  vca.gain.linearRampToValueAtTime(peak, t + a);
+  vca.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak * s), t + a + d);
+  vca.gain.setValueAtTime(Math.max(0.0001, peak * s), t + a + d + hold);
+  vca.gain.exponentialRampToValueAtTime(0.0001, end);
+
+  car.start(t); mod.start(t);
+  car.stop(end + 0.02); mod.stop(end + 0.02);
+  car.onended = () => {
+    try {
+      car.disconnect(); mod.disconnect(); modGain.disconnect();
+      vca.disconnect(); lp.disconnect();
+    } catch (e) {}
+  };
+}
+
+function previewVoice(trackIdx, step) {
+  audioUnlock();
+  if (actx) voice(trackIdx, step);
+}
+
+/* ---------------------------------------------------------- 9. SEQUENCER */
+
+let seqTimer = null, nextTime = 0, schedStep = 0;
+const pending = [];
+
+function startPlay() {
+  if (state.isPlaying) return;
+  audioUnlock();
+  state.isPlaying = true;
+  state.currentStep = -1;
+  schedStep = 0;
+  pending.length = 0;
+
+  if (actx) {
+    nextTime = actx.currentTime + 0.06;
+    seqTimer = setInterval(scheduler, 25);
+  } else {
+    seqTimer = setInterval(() => {
+      state.currentStep = (state.currentStep + 1) % 16;
+      oledDirty = true;
+      invalidate();
+    }, 60000 / (state.bpm * 4));
+  }
+  oledDirty = true;
+  invalidate();
+}
+
+function stopPlay() {
+  if (seqTimer) { clearInterval(seqTimer); seqTimer = null; }
+  state.isPlaying = false;
+  state.currentStep = -1;
+  pending.length = 0;
+  oledDirty = true;
+  invalidate();
+}
+
+function scheduler() {
+  if (!state.isPlaying || !actx) return;
+  const spb = 60 / (state.bpm * 4);
+  let guard = 0;
+  while (nextTime < actx.currentTime + 0.15 && guard++ < 32) {
+    const s = schedStep % 16;
+    for (let t = 0; t < 4; t++) if (state.tracks[t].trigs[s]) voice(t, s, nextTime);
+    pending.push({ s: s, t: nextTime });
+    if (pending.length > 24) pending.shift();
+    nextTime += spb;
+    schedStep++;
+  }
+}
+
+function consumeScheduledSteps() {
+  if (!actx) return;
+  const now = actx.currentTime;
+  let changed = false;
+  while (pending.length && pending[0].t <= now) {
+    state.currentStep = pending.shift().s;
+    changed = true;
+  }
+  if (changed) { oledDirty = true; needsRedraw = true; }
+}
+
+/* ------------------------------------------------------------ 10. REC/WAV */
+
+function fmtTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+}
+function recTime() {
+  const sr = actx ? actx.sampleRate : 44100;
+  if (state.isRecordingWav) return fmtTime((performance.now() - (recStart || performance.now())) / 1000);
+  return fmtTime(recLen / sr);
+}
+
+function toggleRec() {
+  audioUnlock();
+  if (!actx) { toast("AUDIO UNAVAILABLE"); return; }
+  if (state.isRecordingWav) stopRec(false);
+  else startRec();
+}
+
+function startRec() {
+  if (!actx) return;
+  recBufs = [];
+  recLen = 0;
+  recStart = performance.now();
+  state.isRecordingWav = true;
+  state.hasRec = false;
+  if (!state.isPlaying) startPlay();
+  toast("RECORDING");
+  invalidate();
+}
+
+function stopRec(auto) {
+  if (!state.isRecordingWav) return;
+  state.isRecordingWav = false;
+  state.hasRec = recLen > 0;
+  if (auto) stopPlay();
+  toast(state.hasRec ? "CAPTURED " + fmtTime(recLen / actx.sampleRate) : "NOTHING RECORDED");
+  invalidate();
+}
+
+function encodeWav() {
+  const sr = actx ? actx.sampleRate : 44100;
+  const n = recLen;
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); str(8, "WAVE");
+  str(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  str(36, "data"); view.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let b = 0; b < recBufs.length; b++) {
+    const ch = recBufs[b];
+    for (let i = 0; i < ch.length && off < 44 + n * 2; i++) {
+      const s = ch[i] < -1 ? -1 : (ch[i] > 1 ? 1 : ch[i]);
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      off += 2;
+    }
+  }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+function saveWav() {
+  if (!recLen) { toast("NO RECORDING \u2014 PRESS REC"); return; }
+  try {
+    const url = URL.createObjectURL(encodeWav());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "digitone-" + Date.now() + ".wav";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 6000);
+    toast("SAVING WAV");
+  } catch (err) {
+    toast("EXPORT FAILED");
+  }
+}
+
+/* ============================================================== 11. BOOT */
+
+buildHits();
+resize();
+loadProject(true);
+if (visualViewport) visualViewport.addEventListener("resize", resize, { passive: true });
+oledDirty = true;
+invalidate();
+</script>
+</body>
+</html>
