@@ -1,0 +1,2454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0b0b0d">
+<title>Digitone</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0;width:100%;height:100%;background:#0b0b0d;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+    -webkit-tap-highlight-color:transparent;overscroll-behavior:none;touch-action:none}
+  #stage{position:fixed;inset:0;overflow:hidden}
+  /* the panel is scaled with a transform: one GPU composite, no per-frame reflow */
+  #panel{position:absolute;left:50%;top:50%;width:1000px;height:750px;margin:-375px 0 0 -500px;
+    touch-action:none;border-radius:15px;background:#0b0b0d;transform-origin:50% 50%;
+    will-change:transform;backface-visibility:hidden;
+    box-shadow:0 26px 70px rgba(0,0,0,.8),0 1px 0 rgba(255,255,255,.05)}
+  #panel canvas{position:absolute;display:block;pointer-events:none}
+  #base{left:0;top:0;width:1000px;height:750px}
+  #screenlv{left:112px;top:86px;width:384px;height:192px}
+  #fvallv{left:36px;top:690px;width:222px;height:30px}
+  #dyn{left:0;top:0;width:0;height:0}
+</style>
+</head>
+<body>
+<div id="stage"><div id="panel"><canvas id="base" width="1000" height="750"></canvas><canvas id="screenlv" width="384" height="192"></canvas><canvas id="dyn" width="1" height="1"></canvas></div></div>
+<input id="filein" type="file" accept="application/json,.json" tabindex="-1"
+       style="position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;pointer-events:none">
+<script>
+"use strict";
+/* ============================================================================
+   ELEKTRON DIGITONE — CANVAS FRONT PANEL
+   ----------------------------------------------------------------------------
+   RENDERING ARCHITECTURE (tuned for iPad 5 / A9, iOS 16)
+   1. STATIC SURFACE — chassis, print, button faces, encoder bodies and every
+      LED ring are rasterised ONCE into #base. It is never repainted, so its
+      texture is uploaded to the GPU exactly one time.
+   2. LIVE SURFACES  — iOS re-uploads a canvas texture whenever that canvas is
+      painted, so surface AREA is the frame budget. Three small surfaces float
+      above #base:
+        #screenlv  384x192  the 128x64 OLED, refreshed when the screen changes
+        #fvallv    222x30   the status strip value (the only footer part that
+                            moves while a knob is dragged)
+        #dyn       ~160x200 a free canvas that is MOVED AND RESIZED to the
+                            bounding box of whatever else went dirty; its old
+                            pixels are committed into #base before it moves.
+      A knob drag therefore touches ~0.35 MP instead of the 3 MP of the full
+      retina panel, and the encoder ring itself only ~0.09 MP.
+   3. DIRTY FLAG    — needsRedraw gates the loop; with nothing moving and the
+      sequencer stopped the loop schedules nothing at all (0% CPU).
+   4. OLED SCREEN   — a real 128x64 buffer drawn with two pre-baked bitmap
+      faces (6x8 hardware face + 3x5 label face), exactly like the hardware.
+      The static skeleton is cached, so a value change costs one 128x64 blit
+      plus a handful of glyphs instead of a full redraw. It is up-scaled 3x
+      with smoothing OFF.
+   5. INPUT         — touchmove only records the finger position; values are
+      applied once per animation frame (coalesced), and while a knob is moving
+      the OLED is refreshed at ~33 Hz while the ring keeps the full frame rate.
+      ========================================================================== */
+
+/* ---------------------------------------------------------------- 1. STATE */
+
+const MAXV = 127;
+
+const pct   = v => String(Math.round(v / MAXV * 100));
+const bip   = v => (v > 64 ? "+" : "") + (v - 64);
+const ratio = v => (0.25 + v / MAXV * 7.75).toFixed(2);
+const hz    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8)));
+const ratioS = v => (0.25 + v / MAXV * 7.75).toFixed(1);
+const hzS    = v => String(Math.round(20 * Math.pow(2, v / MAXV * 9.8) / 1000));
+const hz4    = v => { const h = 20 * Math.pow(2, v / MAXV * 9.8);
+                      return h >= 1000 ? (h / 1000).toFixed(1) + "K" : String(Math.round(h)); };
+const en = (...n) => v => n[Math.min(n.length - 1, Math.round(v / MAXV * (n.length - 1)))];
+
+const PAGES = ["SYN1", "SYN2", "FLTR", "AMP", "LFO"];
+
+/* eight parameters per page — encoders A..H, in hardware order.
+   f = value shown under the encoder / in the status plate
+   s = compact 3-character value shown on the OLED                            */
+const PAGE_DEFS = {
+  SYN1: [
+    { k: "harm",     l: "HARM",   f: bip,   s: bip },
+    { k: "detune",   l: "DETUNE", f: bip,   s: bip },
+    { k: "feedback", l: "FEEDBK",  f: pct,   s: pct },
+    { k: "mix",      l: "MIX",    f: pct,   s: pct },
+    { k: "ratioC",   l: "RAT C",  f: ratio, s: ratio },
+    { k: "ratioA",   l: "RAT A",  f: ratio, s: ratio },
+    { k: "ratioB",   l: "RAT B",  f: ratio, s: ratio },
+    { k: "level",    l: "LEVEL",  f: pct,   s: pct }
+  ],
+  SYN2: [
+    { k: "mod",    l: "MOD",    f: bip, s: bip },
+    { k: "modf",   l: "MODF",   f: pct, s: pct },
+    { k: "atrk",   l: "ATRK",   f: pct, s: pct },
+    { k: "btrk",   l: "BTRK",   f: pct, s: pct },
+    { k: "phase",  l: "PHASE",  f: pct, s: pct },
+    { k: "drift",  l: "DRIFT",  f: bip, s: bip },
+    { k: "spread", l: "SPREAD", f: pct, s: pct },
+    { k: "level",  l: "LEVEL",  f: pct, s: pct }
+  ],
+  FLTR: [
+    { k: "freq",      l: "FREQ",   f: hz,  s: hz4 },
+    { k: "resonance", l: "RESO",   f: pct, s: pct },
+    { k: "type",      l: "TYPE",   f: en("LP4", "LP2", "HP2", "BP2", "NOT"), s: en("LP4", "LP2", "HP2", "BP2", "NOT") },
+    { k: "env",       l: "ENV",    f: bip, s: bip },
+    { k: "key",       l: "KEYTRK", f: bip, s: bip },
+    { k: "drive",     l: "DRIVE",  f: pct, s: pct },
+    { k: "pan",       l: "PAN",    f: bip, s: bip },
+    { k: "level",     l: "LEVEL",  f: pct, s: pct }
+  ],
+  AMP: [
+    { k: "attack",    l: "ATTACK",  f: pct, s: pct },
+    { k: "decay",     l: "DECAY",   f: pct, s: pct },
+    { k: "sustain",   l: "SUSTAIN", f: pct, s: pct },
+    { k: "release",   l: "RELEASE", f: pct, s: pct },
+    { k: "volume",    l: "VOLUME",  f: pct, s: pct },
+    { k: "overdrive", l: "OVDRV",   f: pct, s: pct },
+    { k: "pan",       l: "PAN",     f: bip, s: bip },
+    { k: "level",     l: "LEVEL",   f: pct, s: pct }
+  ],
+  LFO: [
+    { k: "speed", l: "SPEED", f: pct, s: pct },
+    { k: "shape", l: "SHAPE", f: en("SINE", "TRI", "SQR", "SAW", "RND", "EXP"), s: en("SIN", "TRI", "SQR", "SAW", "RND", "EXP") },
+    { k: "fade",  l: "FADE",  f: pct, s: pct },
+    { k: "phase", l: "PHASE", f: pct, s: pct },
+    { k: "depth", l: "DEPTH", f: pct, s: pct },
+    { k: "dest",  l: "DEST",  f: en("PITCH", "CUTOFF", "AMP", "PAN"), s: en("PIT", "CUT", "AMP", "PAN") },
+    { k: "mult",  l: "MULT",  f: en("1X", "2X", "4X", "8X", "1/2", "1/4"), s: en("1X", "2X", "4X", "8X", "1/2", "1/4") },
+    { k: "trig",  l: "TRIG",  f: en("FREE", "TRIG", "HOLD", "ONE"), s: en("FRE", "TRG", "HLD", "ONE") }
+  ]
+};
+
+const PAGE_DEFAULTS = {
+  SYN1: { harm: 64, detune: 64, feedback: 42, mix: 96, ratioC: 24, ratioA: 40, ratioB: 72, level: 104 },
+  SYN2: { mod: 72, modf: 56, atrk: 64, btrk: 64, phase: 0, drift: 64, spread: 40, level: 104 },
+  FLTR: { freq: 96, resonance: 44, type: 0, env: 20, key: 64, drive: 30, pan: 64, level: 104 },
+  AMP:  { attack: 6, decay: 48, sustain: 96, release: 38, volume: 104, overdrive: 18, pan: 64, level: 104 },
+  LFO:  { speed: 62, shape: 0, fade: 0, phase: 0, depth: 52, dest: 1, mult: 0, trig: 0 }
+};
+
+/* OLED page layouts — mirrors the hardware screen structure */
+const SCREEN_SPEC = {
+  SYN1: { tab: "SYN", num: "1", big: "1", cap: "ALGO", group: "RATIO",    boxLbl: ["C", "A", "B"],
+          thumbs: [["HARM", "wave"], ["DTUN", "bars"], ["FDBK", "diamond"], ["MIX", "xy"]] },
+  SYN2: { tab: "SYN", num: "2", big: "2", cap: "ALGO", group: "MOD",      boxLbl: ["PHS", "DRF", "SPR"],
+          thumbs: [["MOD", "wave"], ["MODF", "bars"], ["ATRK", "diamond"], ["BTRK", "xy"]] },
+  FLTR: { tab: "FLT", num: "1", big: "1", cap: "TYPE", group: "FILTER",   boxLbl: ["KEY", "DRV", "PAN"],
+          thumbs: [["FRQ", "curve"], ["RES", "bars"], ["TYP", "diamond"], ["ENV", "xy"]] },
+  AMP:  { tab: "AMP", num: "1", big: "1", cap: "ENV",  group: "ENVELOPE",  boxLbl: ["VOL", "OVR", "PAN"],
+          thumbs: [["ATK", "env"], ["DEC", "bars"], ["SUS", "bars"], ["REL", "xy"]] },
+  LFO:  { tab: "LFO", num: "1", big: "1", cap: "SHP",  group: "LFO",       boxLbl: ["DEP", "DST", "MUL"],
+          thumbs: [["SPD", "wave"], ["SHP", "bars"], ["FAD", "diamond"], ["PHS", "xy"]] }
+};
+
+const TRACK_RGB  = ["224,66,54", "228,176,60", "62,160,74", "150,74,206"];
+const DEMO_TRIGS = [[0, 4, 8, 12, 14], [2, 6, 10, 13], [0, 3, 7, 11, 15], []];
+
+const state = {
+  tracks: [],
+  currentTrack: 0,
+  currentPage: "SYN1",
+  selParam: 0,
+  bpm: 120,
+  currentStep: 0,
+  isPlaying: false,
+  isRecordingWav: false,
+  masterVol: 104,
+  fine: false,
+  unison: false,
+  midi: false,
+  patternName: "SIDEBANDER",
+  bank: "A",
+  patternNo: "01",
+  msg: "",
+  msgUntil: 0,
+  hasRec: false
+};
+
+function makeTracks() {
+  state.tracks = [];
+  for (let t = 0; t < 4; t++) {
+    const params = {};
+    for (const p of PAGES) params[p] = Object.assign({}, PAGE_DEFAULTS[p]);
+    const trigs = new Array(16).fill(0);
+    for (const s of DEMO_TRIGS[t]) trigs[s] = 1;
+    state.tracks.push({ trigs: trigs, params: params, octave: t * 5 });
+  }
+}
+makeTracks();
+
+/* --------------------------------------------------------------- 2. LAYOUT */
+
+const W = 1000, H = 750;
+
+const G = {
+  screen: { x: 112, y: 86, w: 384, h: 192 },      /* 128x64 hardware pixels at 3x */
+  plate:  { x: 100, y: 64, w: 410, h: 252 },
+  enc: [
+    { id: "A", x: 566, y: 142 }, { id: "B", x: 673, y: 142 },
+    { id: "C", x: 780, y: 142 }, { id: "D", x: 887, y: 142 },
+    { id: "E", x: 566, y: 248 }, { id: "F", x: 673, y: 248 },
+    { id: "G", x: 780, y: 248 }, { id: "H", x: 887, y: 248 }
+  ],
+  knobs: [
+    { id: "master", x: 57, y: 142, r: 30, cap: "MASTER VOLUME" },
+    { id: "level",  x: 57, y: 248, r: 30, cap: "LEVEL / DATA", sub: "SOUND BROWSER" }
+  ],
+  rec:      { x: 620, y: 74, r: 13 },
+  recPanel: { x: 596, y: 40, w: 206, h: 60 },
+  saveWav:  { x: 700, y: 60, w: 90, h: 30 },
+  footer:   { x: 18, y: 622, w: 964, h: 110 }
+};
+
+const BTNS = [
+  { id: "func",     x: 18,  y: 334, w: 82, h: 40, label: "FUNC",     teal: true },
+  { id: "impexp",   x: 116, y: 334, w: 78, h: 40, label: "IMP/EXP" },
+  { id: "saveprj",  x: 202, y: 334, w: 78, h: 40, label: "SAVE PRJ" },
+  { id: "unison",   x: 288, y: 334, w: 78, h: 40, label: "UNISON" },
+  { id: "taptempo", x: 374, y: 334, w: 78, h: 40, label: "TAP TEMPO" },
+  ...PAGES.map((p, i) => ({ id: "page" + i, x: 500 + i * 86, y: 334, w: 76, h: 40, label: p, page: true })),
+  { id: "midi",   x: 18,  y: 384, w: 82, h: 40, label: "MIDI" },
+  { id: "copy",   x: 116, y: 384, w: 78, h: 40, label: "COPY" },
+  { id: "clear",  x: 202, y: 384, w: 78, h: 40, label: "CLEAR" },
+  { id: "paste",  x: 288, y: 384, w: 78, h: 40, label: "PASTE" },
+  { id: "play",   x: 386, y: 384, w: 58, h: 40, icon: "play" },
+  { id: "stop",   x: 452, y: 384, w: 58, h: 40, icon: "stop" },
+  { id: "yes",    x: 536, y: 384, w: 64, h: 40, label: "YES" },
+  { id: "no",     x: 608, y: 384, w: 64, h: 40, label: "NO" },
+  { id: "left",   x: 700, y: 384, w: 40, h: 40, icon: "left" },
+  { id: "right",  x: 748, y: 384, w: 40, h: 40, icon: "right" },
+  { id: "up",     x: 796, y: 384, w: 40, h: 40, icon: "up" },
+  { id: "down",   x: 844, y: 384, w: 40, h: 40, icon: "down" },
+  { id: "page",   x: 900, y: 384, w: 72, h: 40, label: "PAGE" }
+];
+
+const TRIGS = [];
+for (let i = 0; i < 16; i++) {
+  const row = i < 8 ? 0 : 1, col = i % 8;
+  TRIGS.push({ i: i, x: 94 + col * 81, y: row ? 546 : 468, w: 68, h: 64 });
+}
+const TRACKBTN = [
+  { i: 0, x: 766, y: 472, w: 80, h: 54 },
+  { i: 1, x: 858, y: 472, w: 80, h: 54 },
+  { i: 2, x: 766, y: 552, w: 80, h: 54 },
+  { i: 3, x: 858, y: 552, w: 80, h: 54 }
+];
+
+const UI = '-apple-system,BlinkMacSystemFont,"Helvetica Neue",Helvetica,Arial,sans-serif';
+const F = {
+  btn:   "600 10px " + UI,
+  btnLg: "700 12px " + UI,
+  small: "600 9px " + UI,
+  tiny:  "500 8px " + UI,
+  num:   "700 17px " + UI,
+  track: "700 18px " + UI,
+  foot:  "700 17px " + UI,
+  bpm:   "700 26px " + UI
+};
+
+/* ------------------------------------------------------------- 3. HELPERS */
+
+function rr(c, x, y, w, h, r) {
+  r = Math.min(r, w * 0.5, h * 0.5);
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+
+/* ---------------------------------------------------------- 4. CANVAS/DPR */
+
+/* LAYERED SURFACES ---------------------------------------------------------
+   base     — the static artwork, rasterised once (never repainted)
+   screenlv — the 128x64 OLED at 3x, painted only when the screen changes
+   dyn      — a tiny canvas that is MOVED AND RESIZED to the bounding box of
+              the dirty regions, so a knob drag touches ~30k pixels instead of
+              the 3 000 000 of the full retina panel. On iOS every canvas paint
+              re-uploads that canvas' texture, so surface area is everything.
+   bg       — hidden copy of the pure static art, the repair source for regions */
+const panelEl = document.getElementById("panel");
+const baseEl  = document.getElementById("base");
+const sEl     = document.getElementById("screenlv");
+const fEl     = document.getElementById("fvallv");
+const dEl     = document.getElementById("dyn");
+const baseCtx = baseEl.getContext("2d", { alpha: false, desynchronized: true });
+const sCtx    = sEl.getContext("2d", { alpha: true });
+const fCtx    = fEl.getContext("2d", { alpha: true });
+const dCtx    = dEl.getContext("2d", { alpha: true });
+let ctx = baseCtx;                       /* current paint target */
+let panelRect = { left: 0, top: 0, width: 1000, height: 750 };
+
+const bg = document.createElement("canvas");
+const bgc = bg.getContext("2d");
+
+let dpr = 1;
+let needsRedraw = true;
+let oledDirty = true;
+let rafId = 0;
+
+/* --- dirty regions ------------------------------------------------------- */
+const REGIONS = new Map();
+const dirty = new Set();
+
+function addRegion(name, x, y, w, h, draw) {
+  REGIONS.set(name, { name: name, x: x, y: y, w: w, h: h, draw: draw });
+}
+function touch(name) {
+  needsRedraw = true;
+  dirty.add(name);
+  invalidate();
+}
+function touchAll() {
+  needsRedraw = true;
+  REGIONS.forEach(r => dirty.add(r.name));
+  invalidate();
+}
+function invalidate() {
+  needsRedraw = true;
+  if (!rafId) rafId = requestAnimationFrame(frame);
+}
+
+/* repair source: copy the static artwork back under a region */
+function blitBg(dst, r, ox, oy) {
+  const sx = Math.round(r.x * dpr), sy = Math.round(r.y * dpr);
+  const sw = Math.round((r.x + r.w) * dpr) - sx, sh = Math.round((r.y + r.h) * dpr) - sy;
+  if (sw <= 0 || sh <= 0) return;
+  dst.drawImage(bg, sx, sy, sw, sh, Math.round((r.x - ox) * dpr), Math.round((r.y - oy) * dpr), sw, sh);
+}
+
+/* SURFACES -----------------------------------------------------------------
+   Every region is painted on one of three surfaces. Two of them are small and
+   FIXED (the OLED and the footer value strip); the third is a free canvas that
+   is moved and resized to the bounding box of whatever else went dirty. iOS
+   re-uploads a canvas texture on every paint, so surface area is the budget.  */
+const SURF = [
+  { id: "screen", el: sEl, ctx: sCtx, fixed: true,  x: 112, y: 86, w: 384, h: 192 },
+  { id: "fval",   el: fEl, ctx: fCtx, fixed: true,  x: 36,  y: 690, w: 222, h: 30 },
+  { id: "dyn",    el: dEl, ctx: dCtx, fixed: false, x: 0, y: 0, w: 0, h: 0 }
+];
+const surfaceOf = name => name === "screen" ? 0 : (name === "fval" ? 1 : 2);
+const SURF_OF_NAME = { screen: "screen", fval: "fval" };
+let dynX2 = 0, dynY2 = 0;                      /* current dyn rect (CSS px) */
+
+function commitDyn() {
+  const sf = SURF[2];
+  if (sf.w <= 0 || sf.h <= 0) return;
+  baseCtx.setTransform(1, 0, 0, 1, 0, 0);
+  baseCtx.drawImage(sf.el, Math.round(sf.x * dpr), Math.round(sf.y * dpr));
+  baseCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  sf.w = sf.h = 0;
+}
+
+function paintSurface(sf) {
+  const names = [];
+  const id = sf.id;
+  for (const n of dirty) if (SURF_OF_NAME[n] === id || (id === "dyn" && !SURF_OF_NAME[n])) names.push(n);
+  if (!names.length) return;
+
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < names.length; i++) {
+    const r = REGIONS.get(names[i]);
+    if (!r) continue;
+    if (r.x < x0) x0 = r.x;
+    if (r.y < y0) y0 = r.y;
+    if (r.x + r.w > x1) x1 = r.x + r.w;
+    if (r.y + r.h > y1) y1 = r.y + r.h;
+  }
+  if (x1 < x0) { names.forEach(n => dirty.delete(n)); return; }
+
+  const bx = Math.max(0, Math.floor(x0)), by = Math.max(0, Math.floor(y0));
+  const bw = Math.max(1, Math.min(W, Math.ceil(x1)) - bx);
+  const bh = Math.max(1, Math.min(H, Math.ceil(y1)) - by);
+  const c = sf.ctx;
+
+  if (sf.fixed) {
+    /* fixed surface: exactly the union of its regions, repaint whole */
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.clearRect(0, 0, sf.el.width, sf.el.height);
+  } else if (bx !== sf.x || by !== sf.y || bw !== sf.w || bh !== sf.h) {   /* dyn only */
+    commitDyn();                                     /* keep the older pixels */
+    sf.x = bx; sf.y = by; sf.w = bw; sf.h = bh;
+    sf.el.style.left = bx + "px"; sf.el.style.top = by + "px";
+    sf.el.style.width = bw + "px"; sf.el.style.height = bh + "px";
+    sf.el.width = Math.max(1, Math.round(bw * dpr));
+    sf.el.height = Math.max(1, Math.round(bh * dpr));
+  }
+
+  const ox = sf.fixed ? sf.x : bx, oy = sf.fixed ? sf.y : by;
+  const prev = ctx;
+  for (let i = 0; i < names.length; i++) {
+    const r = REGIONS.get(names[i]);
+    if (!r) continue;
+    if (!sf.fixed) {
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      c.clearRect(Math.round((r.x - ox) * dpr) - 1, Math.round((r.y - oy) * dpr) - 1,
+                  Math.round(r.w * dpr) + 2, Math.round(r.h * dpr) + 2);
+    }
+    blitBg(c, r, ox, oy);
+    ctx = c;
+    c.setTransform(dpr, 0, 0, dpr, -ox * dpr, -oy * dpr);
+    r.draw();                                        /* no clip(): the surface bounds it */
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    dirty.delete(names[i]);
+  }
+  ctx = prev;
+}
+
+let lastScreenAt = 0;
+
+function paintDirty() {
+  if (!dirty.size) return;
+  /* while a knob is moving the OLED is refreshed at ~33 Hz and the encoder
+     ring at the full frame rate — the finger follows the pixel, the digits
+     follow the eye. Cuts the largest surface upload by a third.            */
+  const now = performance.now();
+  const hold = drags.size > 0 && dirty.has("screen") && (now - lastScreenAt) < 30;
+  if (!hold) { lastScreenAt = now; paintSurface(SURF[0]); }
+  paintSurface(SURF[1]);
+  paintSurface(SURF[2]);
+  dirty.clear();
+  if (hold) { dirty.add("screen"); invalidate(); }
+}
+
+/* full repaint — first frame, resize, orientation change */
+function drawUI() {
+  commitDyn();
+  baseCtx.setTransform(1, 0, 0, 1, 0, 0);
+  baseCtx.drawImage(bg, 0, 0);
+  baseCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const prev = ctx;
+  ctx = baseCtx;
+  REGIONS.forEach(r => {
+    if (SURF_OF_NAME[r.name]) return;
+    baseCtx.save();
+    baseCtx.beginPath();
+    baseCtx.rect(r.x, r.y, r.w, r.h);
+    baseCtx.clip();
+    r.draw();
+    baseCtx.restore();
+  });
+  ctx = prev;
+  oledDirty = true;                       /* full repaint always refreshes the OLED */
+  dirty.add("screen"); dirty.add("fval");
+  paintSurface(SURF[0]);
+  paintSurface(SURF[1]);
+  dirty.clear();
+  needsRedraw = false;
+}
+
+function frame() {
+  rafId = 0;
+  applyDrags();
+  if (dirty.size) { paintDirty(); needsRedraw = false; }
+  /* nothing to animate -> the loop stops and the GPU goes idle (0% CPU) */
+}
+
+function resize() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.995;
+  panelEl.style.transform = "scale(" + s + ")";           /* one GPU composite */
+  const d = Math.min(window.devicePixelRatio || 1, 2);    /* cap: A9 fill-rate */
+  if (d !== dpr || bg.width !== Math.round(W * d)) {
+    dpr = d;
+    baseEl.width = Math.round(W * dpr);
+    baseEl.height = Math.round(H * dpr);
+    sEl.width = Math.round(G.screen.w * dpr);
+    sEl.height = Math.round(G.screen.h * dpr);
+    fEl.width = Math.round(222 * dpr);
+    fEl.height = Math.round(30 * dpr);
+    SURF[2].w = SURF[2].h = 0;
+    dEl.width = dEl.height = 1;
+    buildStatic();
+  }
+  const r = panelEl.getBoundingClientRect();
+  panelRect = { left: r.left, top: r.top, width: r.width, height: r.height };
+  drawUI();
+  invalidate();
+}
+window.addEventListener("resize", resize, { passive: true });
+window.addEventListener("orientationchange", () => setTimeout(resize, 220), { passive: true });
+
+/* =========================================================== STATIC LAYER */
+
+let seed = 1337;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed; }
+
+function buildStatic() {
+  bg.width = Math.round(W * dpr);
+  bg.height = Math.round(H * dpr);
+  const c = bgc;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, W, H);
+
+  c.fillStyle = "#0b0b0d";
+  c.fillRect(0, 0, W, H);
+
+  /* chassis */
+  const chassis = c.createLinearGradient(0, 0, 0, H);
+  chassis.addColorStop(0, "#292a2b");
+  chassis.addColorStop(0.28, "#1f1f21");
+  chassis.addColorStop(0.72, "#191919");
+  chassis.addColorStop(1, "#111112");
+  rr(c, 6, 6, W - 12, H - 12, 18);
+  c.fillStyle = chassis;
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.075)";
+  c.lineWidth = 1.5;
+  c.stroke();
+  rr(c, 11, 11, W - 22, H - 22, 14);
+  c.strokeStyle = "rgba(0,0,0,.55)";
+  c.lineWidth = 2;
+  c.stroke();
+
+  seed = 1337;
+  for (let i = 0; i < 54; i++) {
+    const y = 14 + (rnd() % (H - 28));
+    c.fillStyle = i % 2 ? "rgba(255,255,255,.012)" : "rgba(0,0,0,.055)";
+    c.fillRect(12, y, W - 24, 1);
+  }
+
+  /* screws */
+  for (const p of [[26, 26], [974, 26], [26, 724], [974, 724]]) {
+    c.beginPath(); c.arc(p[0], p[1], 7, 0, 6.2832);
+    c.fillStyle = "#2a2a2e"; c.fill();
+    c.strokeStyle = "#0c0c0e"; c.lineWidth = 1; c.stroke();
+    c.beginPath(); c.moveTo(p[0] - 4, p[1]); c.lineTo(p[0] + 4, p[1]);
+    c.strokeStyle = "rgba(0,0,0,.85)"; c.lineWidth = 1.6; c.stroke();
+    c.beginPath(); c.arc(p[0], p[1], 7, Math.PI * 1.1, Math.PI * 1.7);
+    c.strokeStyle = "rgba(255,255,255,.10)"; c.lineWidth = 1; c.stroke();
+  }
+
+  /* top I/O strip */
+  const io = [
+    ["LEFT", 70], ["RIGHT", 132], ["INPUT L", 225], ["INPUT R", 295],
+    ["MIDI IN", 385], ["MIDI OUT", 474], ["MIDI THRU", 590],
+    ["USB", 690], ["DC IN", 790], ["POWER", 884]
+  ];
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.font = "500 8.5px " + UI;
+  c.fillStyle = "#8e8e97";
+  for (const [label, x] of io) c.fillText(label, x, 22);
+  c.font = "500 7.5px " + UI;
+  c.fillStyle = "#65656e";
+  c.fillText("SYNC A", 474, 33);
+  c.fillText("SYNC B", 590, 33);
+  for (const [, x] of io) {
+    c.beginPath(); c.arc(x, 10, 2.6, 0, 6.2832);
+    c.strokeStyle = "rgba(0,0,0,.75)"; c.lineWidth = 2; c.stroke();
+    c.strokeStyle = "rgba(255,255,255,.07)"; c.lineWidth = 1; c.stroke();
+  }
+  c.fillStyle = "rgba(255,255,255,.05)";
+  c.fillRect(20, 45, W - 40, 1);
+
+  /* ELEKTRON wordmark */
+  c.save();
+  c.textAlign = "right";
+  c.textBaseline = "alphabetic";
+  c.font = "700 30px " + UI;
+  c.fillStyle = "#f4f4f6";
+  c.fillText("elektron", 968, 84);
+  c.restore();
+
+  /* WAV recorder housing */
+  const rp = G.recPanel;
+  rr(c, rp.x, rp.y, rp.w, rp.h, 8);
+  c.fillStyle = "#141417";
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.07)";
+  c.lineWidth = 1;
+  c.stroke();
+  c.textAlign = "left";
+  c.textBaseline = "middle";
+  c.font = "600 7.5px " + UI;
+  c.fillStyle = "#82828c";
+  c.fillText("W A V   R E C O R D E R", rp.x + 12, rp.y + 13);
+
+  /* screen plate — the "Digitone" name lives inside it, like the hardware */
+  const pl = G.plate, s = G.screen;
+  rr(c, pl.x - 2, pl.y - 2, pl.w + 4, pl.h + 4, 11);
+  c.fillStyle = "#08080a";
+  c.fill();
+  const pg = c.createLinearGradient(0, pl.y, 0, pl.y + pl.h);
+  pg.addColorStop(0, "#161618");
+  pg.addColorStop(0.55, "#111113");
+  pg.addColorStop(1, "#0c0c0e");
+  rr(c, pl.x, pl.y, pl.w, pl.h, 8);
+  c.fillStyle = pg;
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.06)";
+  c.lineWidth = 1;
+  c.stroke();
+
+  c.textAlign = "left";
+  c.textBaseline = "middle";
+  c.fillStyle = "#b9b9c2";
+  c.font = "500 9.5px " + UI;
+  c.fillText("Polyphonic Digital Synthesizer", s.x + 4, pl.y + 13);
+
+  c.textBaseline = "alphabetic";
+  c.fillStyle = "#f2f2f5";
+  c.font = "700 30px " + UI;
+  c.fillText("Digitone", pl.x + 24, pl.y + pl.h - 16);
+
+  /* OLED well */
+  c.fillStyle = "#0a0b00";
+  c.fillRect(s.x, s.y, s.w, s.h);
+  c.strokeStyle = "rgba(0,0,0,.9)";
+  c.lineWidth = 2;
+  c.strokeRect(s.x - 1, s.y - 1, s.w + 2, s.h + 2);
+  c.strokeStyle = "rgba(255,204,0,.09)";
+  c.lineWidth = 1;
+  c.strokeRect(s.x - 3.5, s.y - 3.5, s.w + 7, s.h + 7);
+
+  /* encoder bodies + letters, knobs + captions */
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  for (const e of G.enc) {
+    encoderBody(c, e.x, e.y, 27);
+    c.font = "700 12px " + UI;
+    c.fillStyle = "#c6c6d0";
+    c.fillText(e.id, e.x, e.y + 44);
+  }
+  for (const k of G.knobs) {
+    encoderBody(c, k.x, k.y, k.r);
+    c.font = "600 8px " + UI;
+    c.fillStyle = "#8a8a94";
+    c.fillText(k.cap, k.x, k.y + k.r + 16);
+    if (k.sub) {
+      c.font = "500 7.5px " + UI;
+      c.fillStyle = "#67676f";
+      c.fillText(k.sub, k.x, k.y + k.r + 27);
+    }
+  }
+
+  for (const b of BTNS) buttonFace(c, b);
+  for (const t of TRIGS) trigFace(c, t);
+  for (const t of TRACKBTN) trackFace(c, t);
+
+  /* status plate */
+  const f = G.footer;
+  rr(c, f.x, f.y, f.w, f.h, 12);
+  c.fillStyle = "#141416";
+  c.fill();
+  c.strokeStyle = "rgba(255,255,255,.055)";
+  c.lineWidth = 1;
+  c.stroke();
+  c.fillStyle = "rgba(255,255,255,.035)";
+  for (const x of [288, 668]) c.fillRect(x, f.y + 18, 1, f.h - 36);
+
+  c.textAlign = "left";
+  c.font = "600 8px " + UI;
+  c.fillStyle = "#63636d";
+  c.fillText("A C T I V E   T R A C K", 38, 644);
+}
+
+function encoderBody(c, x, y, r) {
+  c.beginPath();
+  c.ellipse(x, y + 3, r * 1.02, r * 0.96, 0, 0, 6.2832);
+  c.fillStyle = "rgba(0,0,0,.45)";
+  c.fill();
+
+  const g = c.createRadialGradient(x - r * 0.35, y - r * 0.45, r * 0.15, x, y, r * 1.05);
+  g.addColorStop(0, "#4c4c53");
+  g.addColorStop(0.55, "#33333a");
+  g.addColorStop(1, "#1b1b1f");
+  c.beginPath(); c.arc(x, y, r, 0, 6.2832);
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.85)"; c.lineWidth = 1.5; c.stroke();
+
+  c.beginPath(); c.arc(x, y, r * 0.74, 0, 6.2832);
+  c.strokeStyle = "rgba(0,0,0,.28)"; c.lineWidth = 1; c.stroke();
+  c.beginPath(); c.arc(x, y, r - 1.5, Math.PI * 1.12, Math.PI * 1.72);
+  c.strokeStyle = "rgba(255,255,255,.15)"; c.lineWidth = 1.6; c.stroke();
+  c.beginPath(); c.arc(x, y, r - 1.5, Math.PI * 0.12, Math.PI * 0.45);
+  c.strokeStyle = "rgba(255,255,255,.05)"; c.lineWidth = 1.4; c.stroke();
+}
+
+function buttonFace(c, b) {
+  rr(c, b.x, b.y + 1.5, b.w, b.h, 8);
+  c.fillStyle = "rgba(0,0,0,.5)";
+  c.fill();
+  rr(c, b.x, b.y, b.w, b.h, 8);
+  const g = c.createLinearGradient(0, b.y, 0, b.y + b.h);
+  if (b.teal) {
+    g.addColorStop(0, "#4fd6cf"); g.addColorStop(0.5, "#33b9b2"); g.addColorStop(1, "#1f938d");
+  } else {
+    g.addColorStop(0, "#34343b"); g.addColorStop(0.5, "#2a2a31"); g.addColorStop(1, "#1d1d22");
+  }
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
+  c.beginPath();
+  c.moveTo(b.x + 7, b.y + 1.6); c.lineTo(b.x + b.w - 7, b.y + 1.6);
+  c.strokeStyle = b.teal ? "rgba(255,255,255,.35)" : "rgba(255,255,255,.10)";
+  c.lineWidth = 1; c.stroke();
+}
+
+function trigFace(c, t) {
+  rr(c, t.x, t.y + 2, t.w, t.h, 9);
+  c.fillStyle = "rgba(0,0,0,.55)";
+  c.fill();
+  rr(c, t.x, t.y, t.w, t.h, 9);
+  const g = c.createLinearGradient(0, t.y, 0, t.y + t.h);
+  g.addColorStop(0, "#303037"); g.addColorStop(0.55, "#26262b"); g.addColorStop(1, "#1a1a1e");
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
+  c.beginPath();
+  c.moveTo(t.x + 8, t.y + 1.6); c.lineTo(t.x + t.w - 8, t.y + 1.6);
+  c.strokeStyle = "rgba(255,255,255,.09)"; c.lineWidth = 1; c.stroke();
+}
+
+function trackFace(c, t) {
+  rr(c, t.x, t.y + 2, t.w, t.h, 9);
+  c.fillStyle = "rgba(0,0,0,.55)";
+  c.fill();
+  rr(c, t.x, t.y, t.w, t.h, 9);
+  const g = c.createLinearGradient(0, t.y, 0, t.y + t.h);
+  g.addColorStop(0, "#2d2d34");
+  g.addColorStop(1, "#191920");
+  c.fillStyle = g; c.fill();
+  c.strokeStyle = "rgba(0,0,0,.7)"; c.lineWidth = 1; c.stroke();
+}
+
+/* ============================================== OLED — 128 x 64, like the HW */
+
+const SW = 128, SH = 64;
+const oled = document.createElement("canvas");
+oled.width = SW;
+oled.height = SH;
+const octx = oled.getContext("2d");
+
+const FG = "#ffcc00", BG = "#0a0b00";
+
+/* 5x7 bitmap font */
+const GL = {
+  " ": [0, 0, 0, 0, 0, 0, 0],
+  "0": [14, 17, 19, 21, 25, 17, 14], "1": [4, 12, 4, 4, 4, 4, 14],
+  "2": [14, 17, 1, 2, 4, 8, 31],     "3": [31, 2, 4, 2, 1, 17, 14],
+  "4": [2, 6, 10, 18, 31, 2, 2],     "5": [31, 16, 30, 1, 1, 17, 14],
+  "6": [6, 8, 16, 30, 17, 17, 14],   "7": [31, 1, 2, 4, 8, 8, 8],
+  "8": [14, 17, 17, 14, 17, 17, 14], "9": [14, 17, 17, 15, 1, 2, 12],
+  "A": [14, 17, 17, 31, 17, 17, 17], "B": [30, 17, 17, 30, 17, 17, 30],
+  "C": [14, 17, 16, 16, 16, 17, 14], "D": [28, 18, 17, 17, 17, 18, 28],
+  "E": [31, 16, 16, 30, 16, 16, 31], "F": [31, 16, 16, 30, 16, 16, 16],
+  "G": [14, 17, 16, 23, 17, 17, 15], "H": [17, 17, 17, 31, 17, 17, 17],
+  "I": [14, 4, 4, 4, 4, 4, 14],      "J": [1, 1, 1, 1, 17, 17, 14],
+  "K": [17, 18, 20, 24, 20, 18, 17], "L": [16, 16, 16, 16, 16, 16, 31],
+  "M": [17, 27, 21, 17, 17, 17, 17], "N": [17, 25, 21, 19, 17, 17, 17],
+  "O": [14, 17, 17, 17, 17, 17, 14], "P": [30, 17, 17, 30, 16, 16, 16],
+  "Q": [14, 17, 17, 17, 21, 18, 13], "R": [30, 17, 17, 30, 20, 18, 17],
+  "S": [15, 16, 16, 14, 1, 1, 30],   "T": [31, 4, 4, 4, 4, 4, 4],
+  "U": [17, 17, 17, 17, 17, 17, 14], "V": [17, 17, 17, 17, 17, 10, 4],
+  "W": [17, 17, 17, 21, 21, 27, 17], "X": [17, 17, 10, 4, 10, 17, 17],
+  "Y": [17, 17, 10, 4, 4, 4, 4],     "Z": [31, 1, 2, 4, 8, 16, 31],
+  ".": [0, 0, 0, 0, 0, 12, 12],      ":": [0, 12, 12, 0, 12, 12, 0],
+  "-": [0, 0, 0, 31, 0, 0, 0],       "+": [0, 4, 4, 31, 4, 4, 0],
+  "/": [1, 2, 2, 4, 8, 8, 16],       "%": [25, 26, 2, 4, 8, 11, 19],
+  ">": [8, 4, 2, 1, 2, 4, 8],        "<": [2, 4, 8, 16, 8, 4, 2],
+  "=": [0, 0, 31, 0, 31, 0, 0],      "!": [4, 4, 4, 4, 4, 0, 4],
+  "#": [10, 10, 31, 10, 31, 10, 10], "*": [0, 4, 21, 14, 21, 4, 0],
+  "(": [2, 4, 8, 8, 8, 4, 2],        ")": [8, 4, 2, 2, 2, 4, 8],
+  "[": [14, 8, 8, 8, 8, 8, 14],      "]": [14, 2, 2, 2, 2, 2, 14],
+  "|": [4, 4, 4, 4, 4, 4, 4],        ",": [0, 0, 0, 0, 12, 4, 8]
+};
+
+const GLYPH_ORDER = Object.keys(GL);
+const GIDX = {};
+GLYPH_ORDER.forEach((ch, i) => { GIDX[ch] = i; });
+
+/* one pre-baked atlas per colour: glyph blits instead of ~15 fillRects each */
+function buildAtlas(color) {
+  const cv = document.createElement("canvas");
+  cv.width = GLYPH_ORDER.length * 6;
+  cv.height = 7;
+  const c = cv.getContext("2d");
+  c.fillStyle = color;
+  for (let i = 0; i < GLYPH_ORDER.length; i++) {
+    const g = GL[GLYPH_ORDER[i]];
+    for (let r = 0; r < 7; r++) {
+      const bits = g[r];
+      if (!bits) continue;
+      for (let b = 0; b < 5; b++) if (bits & (16 >> b)) c.fillRect(i * 6 + b, r, 1, 1);
+    }
+  }
+  return cv;
+}
+const ATLAS = { fg: null, bg: null };
+
+function pxText(x, y, s, col, scale) {
+  const a = ATLAS[col === "bg" ? "bg" : "fg"];
+  const k = scale || 1;
+  for (let i = 0; i < s.length; i++) {
+    const id = GIDX[s[i]];
+    if (id === undefined) continue;
+    octx.drawImage(a, id * 6, 0, 5, 7, x + i * 6 * k, y, 5 * k, 7 * k);
+  }
+}
+const textW = (s, k) => s.length * 6 * (k || 1) - (k || 1);
+
+/* small drawing helpers on the OLED */
+function fillBox(x, y, w, h) { octx.fillStyle = FG; octx.fillRect(x, y, w, h); }
+function box(x, y, w, h) {
+  octx.fillStyle = FG;
+  octx.fillRect(x, y, w, 1);
+  octx.fillRect(x, y + h - 1, w, 1);
+  octx.fillRect(x, y, 1, h);
+  octx.fillRect(x + w - 1, y, 1, h);
+}
+function dashBox(x, y, w, h) {
+  octx.fillStyle = FG;
+  for (let i = 0; i < w; i += 2) { octx.fillRect(x + i, y, 1, 1); octx.fillRect(x + i, y + h - 1, 1, 1); }
+  for (let j = 0; j < h; j += 2) { octx.fillRect(x, y + j, 1, 1); octx.fillRect(x + w - 1, y + j, 1, 1); }
+}
+function vLine(x, y0, y1) { octx.fillStyle = FG; octx.fillRect(x, y0, 1, y1 - y0 + 1); }
+function hLine(x0, x1, y) { octx.fillStyle = FG; octx.fillRect(x0, y, x1 - x0 + 1, 1); }
+function dottedV(x, y0, y1) { octx.fillStyle = FG; for (let y = y0; y <= y1; y += 2) octx.fillRect(x, y, 1, 1); }
+
+/* ----------------------------------------------------------- screen render */
+
+/* --- small 3x5 face: every label and value on the hardware screen --------- */
+const GLS = {
+  " ": [0,0,0,0,0],
+  "0": [7,5,5,5,7], "1": [2,6,2,2,7], "2": [6,1,2,4,7], "3": [6,1,2,1,6],
+  "4": [5,5,7,1,1], "5": [7,4,6,1,6], "6": [3,4,7,5,7], "7": [7,1,2,2,2],
+  "8": [7,5,7,5,7], "9": [7,5,7,1,6],
+  "A": [2,5,7,5,5], "B": [6,5,6,5,6], "C": [3,4,4,4,3], "D": [6,5,5,5,6],
+  "E": [7,4,6,4,7], "F": [7,4,6,4,4], "G": [3,4,5,5,3], "H": [5,5,7,5,5],
+  "I": [7,2,2,2,7], "J": [1,1,1,5,2], "K": [5,5,6,5,5], "L": [4,4,4,4,7],
+  "M": [5,7,7,5,5], "N": [5,7,5,5,5], "O": [7,5,5,5,7], "P": [6,5,6,4,4],
+  "Q": [2,5,5,6,3], "R": [6,5,6,5,5], "S": [3,4,2,1,6], "T": [7,2,2,2,2],
+  "U": [5,5,5,5,7], "V": [5,5,5,5,2], "W": [5,5,7,7,5], "X": [5,5,2,5,5],
+  "Y": [5,5,2,2,2], "Z": [7,1,2,4,7],
+  ".": [0,0,0,0,2], ":": [0,2,0,2,0], "-": [0,0,7,0,0], "+": [0,2,7,2,0],
+  "/": [1,1,2,4,4], "%": [5,1,2,4,5], ">": [4,2,1,2,4], "<": [1,2,4,2,1],
+  "=": [0,7,0,7,0], "*": [0,5,2,5,0], "!": [2,2,2,0,2], "#": [5,7,5,7,5]
+};
+const SORDER = Object.keys(GLS);
+const SIDX = {};
+SORDER.forEach((ch, i) => { SIDX[ch] = i; });
+
+function buildAtlasS(color) {
+  const cv = document.createElement("canvas");
+  cv.width = SORDER.length * 4;
+  cv.height = 5;
+  const c = cv.getContext("2d");
+  c.fillStyle = color;
+  for (let i = 0; i < SORDER.length; i++) {
+    const g = GLS[SORDER[i]];
+    for (let r = 0; r < 5; r++) {
+      const bits = g[r];
+      if (!bits) continue;
+      for (let b = 0; b < 3; b++) if (bits & (4 >> b)) c.fillRect(i * 4 + b, r, 1, 1);
+    }
+  }
+  return cv;
+}
+const ATLAS_S = { fg: null, bg: null };
+
+function sText(x, y, s, col) {
+  const a = ATLAS_S[col === "bg" ? "bg" : "fg"];
+  if (!a) return;
+  for (let i = 0; i < s.length; i++) {
+    const id = SIDX[s[i]];
+    if (id === undefined) continue;
+    octx.drawImage(a, id * 4, 0, 3, 5, x + i * 4, y, 3, 5);
+  }
+}
+const sW = s => s.length * 4 - 1;
+
+/* --- hardware box styles: 1px chamfer, filled chips, pill bars ------------ */
+function rbox(x, y, w, h) {
+  octx.fillStyle = FG;
+  octx.fillRect(x + 1, y, w - 2, 1);
+  octx.fillRect(x + 1, y + h - 1, w - 2, 1);
+  octx.fillRect(x, y + 1, 1, h - 2);
+  octx.fillRect(x + w - 1, y + 1, 1, h - 2);
+}
+function rfill(x, y, w, h) {
+  octx.fillStyle = FG;
+  octx.fillRect(x + 1, y, w - 2, h);
+  octx.fillRect(x, y + 1, w, h - 2);
+}
+function pill(x, y, w, h) {                    /* small rounded value bar */
+  octx.fillStyle = FG;
+  octx.fillRect(x + 1, y, w - 2, h);
+  octx.fillRect(x, y + 1, w, h - 2);
+}
+
+/* --- layout, measured off the real panel --------------------------------- */
+const LY = {
+  chip:   { x: 0, y: 0, w: 18, h: 9 },
+  name:   { x: 20, y: 1 },
+  tempo:  { x: 86, y: 0, w: 42, h: 9 },
+  tab:    { x: 0, y: 12, w: 16, h: 23 },
+  meter:  { x: 0, y: 38, w: 16, h: 13 },
+  tree:   { ax: 21, ay: 24, bx: 33, by: 12, cx: 21, cy: 37, w: 11, h: 9 },
+  algo:   { x: 48, y: 12, w: 17, h: 18 },
+  boxes:  [67, 87, 107], boxW: 19, boxY: 12, boxH: 18,
+  thumbs: [48, 68, 88, 108], thumbW: 18, thumbY: 37, thumbH: 13
+};
+
+const oledSk = document.createElement("canvas");
+oledSk.width = SW; oledSk.height = SH;
+const skc = oledSk.getContext("2d");
+let OLED_KEY = "";
+
+/* skeleton: everything that only changes with page / track / selection */
+function drawOLEDSkeleton(page, spec, sel) {
+  octx.fillStyle = BG;
+  octx.fillRect(0, 0, SW, SH);
+
+  /* header — bank/pattern chip, name, tempo chip */
+  rfill(LY.chip.x, LY.chip.y, LY.chip.w, LY.chip.h);
+  sText(LY.chip.x + 3, LY.chip.y + 2, state.bank + state.patternNo, "bg");
+
+  const t = LY.tempo;
+  rfill(t.x, t.y, t.w, t.h);
+  octx.fillStyle = BG;
+  if (state.isPlaying) {                        /* transport glyph */
+    for (let i = 0; i < 5; i++) octx.fillRect(t.x + 2, t.y + 2 + i, 1, 5 - i);
+    for (let i = 0; i < 4; i++) octx.fillRect(t.x + 3 + i, t.y + 2 + i, 1, 5 - i);
+  } else {
+    octx.fillRect(t.x + 2, t.y + 2, 4, 5);
+  }
+  const bpm = state.bpm.toFixed(1);
+  pxText(t.x + t.w - 4 - textW(bpm), t.y + 1, bpm, "bg");
+
+  const nameW = t.x - 2 - LY.name.x;
+  const nMax = Math.max(0, Math.floor((nameW + 1) / 6));
+  pxText(LY.name.x, LY.name.y, state.patternName.slice(0, nMax), "fg");
+
+  /* page tab */
+  rbox(LY.tab.x, LY.tab.y, LY.tab.w, LY.tab.h);
+  sText(2, LY.tab.y + 1, spec.tab, "fg");
+  pxText(3, LY.tab.y + 7, spec.num, "fg", 2);
+
+  /* level meter frame */
+  dashBox(LY.meter.x, LY.meter.y, LY.meter.w, LY.meter.h);
+  sText(2, LY.meter.y + LY.meter.h + 2, "LEV", "fg");
+
+  /* centre: operator tree (SYN pages) or nothing (graph is dynamic) */
+  if (page === "SYN1" || page === "SYN2") {
+    const T = LY.tree, w = T.w, h = T.h, o = 3;
+    const blk = (x, y, ch) => { rbox(x, y, w, h); pxText(x + o, y + 1, ch, "fg"); };
+    blk(T.bx, T.by, "B");
+    blk(T.ax, T.ay, "A");
+    blk(T.bx, T.ay, "B");
+    blk(T.cx, T.cy, "C");
+    vLine(T.bx + 5, T.by + h, T.ay - 1);           /* B top -> B mid */
+    hLine(T.ax + w, T.ax + w, T.ay + 4);           /* A -> B mid */
+    vLine(T.ax + 5, T.ay + h, T.cy - 1);           /* A -> C */
+    dottedV(T.cx + 5, T.cy + h, 50);
+    dottedV(T.bx + 5, T.ay + h, 50);
+    sText(T.cx + 3, 52, "X", "fg");
+    sText(T.bx + 3, 52, "Y", "fg");
+  }
+
+  /* algorithm box + caption */
+  const A = LY.algo;
+  rbox(A.x, A.y, A.w, A.h);
+  pxText(A.x + 4, A.y + 2, spec.big, "fg", 2);
+  sText(A.x, A.y + A.h + 1, spec.cap, "fg");
+
+  /* three value boxes: letter notched into the top edge */
+  for (let i = 0; i < 3; i++) {
+    const x = LY.boxes[i];
+    if (sel === 4 + i) rfill(x, LY.boxY, LY.boxW, LY.boxH);
+    else rbox(x, LY.boxY, LY.boxW, LY.boxH);
+    const on = sel === 4 + i;
+    octx.fillStyle = on ? FG : BG;
+    octx.fillRect(x + 2, LY.boxY, 6, 1);           /* notch in the border   */
+    sText(x + 4, LY.boxY, spec.boxLbl[i], on ? "bg" : "fg");
+  }
+  const grp = spec.group;
+  sText(LY.boxes[0] + ((LY.boxes[2] + LY.boxW - LY.boxes[0] - sW(grp)) >> 1), 30, grp, "fg");
+
+  /* four parameter thumbnails + captions */
+  for (let i = 0; i < 4; i++) {
+    const x = LY.thumbs[i];
+    if (sel === i) rfill(x, LY.thumbY, LY.thumbW, LY.thumbH);
+    else rbox(x, LY.thumbY, LY.thumbW, LY.thumbH);
+    const lbl = spec.thumbs[i][0];
+    sText(x + ((LY.thumbW - sW(lbl)) >> 1), LY.thumbY + LY.thumbH + 2, lbl, "fg");
+  }
+}
+
+/* dynamic layer: values, bars, thumbnails, meter, graph */
+function drawOLEDDynamic(page, spec, sel, defs, v) {
+  for (let i = 0; i < 3; i++) {
+    const idx = 4 + i, x = LY.boxes[i];
+    sText(x + 2, 17, defs[idx].s(v(idx)), sel === idx ? "bg" : "fg");
+    const bx = x + 2, bw = LY.boxW - 5;
+    octx.fillStyle = sel === idx ? BG : FG;
+    octx.fillRect(bx, 24, bw, 3);
+    octx.fillStyle = sel === idx ? BG : FG;
+    octx.fillRect(bx, 25, Math.max(1, Math.round(bw * v(idx) / MAXV)), 1);
+  }
+  for (let i = 0; i < 4; i++) {
+    drawThumb(spec.thumbs[i][1], LY.thumbs[i] + 3, LY.thumbY + 2, LY.thumbW - 6, LY.thumbH - 4,
+              v(i), sel === i);
+  }
+  if (page !== "SYN1" && page !== "SYN2") drawScreenGraphic(page, v);
+
+  /* level meter: vertical bar inside the dashed frame */
+  const lvl = Math.max(0.05, v(7) / MAXV);
+  const m = LY.meter, h = Math.round((m.h - 4) * lvl);
+  octx.fillStyle = FG;
+  octx.fillRect(m.x + 6, m.y + m.h - 2 - h, 5, h);
+  octx.fillRect(m.x + 6, m.y + 1, 1, 1);
+}
+
+function renderOLED() {
+  const page = state.currentPage;
+  const defs = PAGE_DEFS[page];
+  const spec = SCREEN_SPEC[page];
+  const pv = state.tracks[state.currentTrack].params[page];
+  const sel = state.selParam;
+  const v = i => pv[defs[i].k];
+
+  const key = page + "|" + state.currentTrack + "|" + sel + "|" + state.bpm.toFixed(1) + "|" +
+              (state.isPlaying ? 1 : 0) + "|" + state.bank + state.patternNo + "|" + state.patternName;
+  if (key !== OLED_KEY) {                 /* only the skeleton changed rarely */
+    OLED_KEY = key;
+    drawOLEDSkeleton(page, spec, sel);
+    skc.clearRect(0, 0, SW, SH);
+    skc.drawImage(oled, 0, 0);
+  } else {
+    octx.clearRect(0, 0, SW, SH);
+    octx.drawImage(oledSk, 0, 0);
+  }
+  drawOLEDDynamic(page, spec, sel, defs, v);
+  oledDirty = false;
+}
+
+function drawThumb(kind, x, y, w, h, val, inverted) {
+  const col = inverted ? BG : FG;
+  octx.fillStyle = col;
+  octx.strokeStyle = col;
+  octx.lineWidth = 1;
+  const t = val / MAXV;
+
+  if (kind === "wave") {
+    const cyc = 1 + Math.round(t * 2);
+    octx.beginPath();
+    for (let i = 0; i <= w; i++) {
+      const yy = y + h / 2 - Math.sin((i / w) * Math.PI * 2 * cyc) * (h / 2 - 1);
+      i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+    }
+    octx.stroke();
+  } else if (kind === "bars") {
+    for (let i = 0; i < 3; i++) {
+      const yy = y + 2 + i * 3;
+      octx.fillRect(x, yy, w, 1);
+      octx.fillRect(x + Math.round((w - 3) * (0.2 + t * 0.8)), yy - 1, 3, 3);
+    }
+  } else if (kind === "diamond") {
+    const cx = x + w / 2, cy = y + h / 2, r = Math.min(w, h) / 2 - 1;
+    octx.beginPath();
+    octx.moveTo(cx, cy - r); octx.lineTo(cx + r, cy); octx.lineTo(cx, cy + r); octx.lineTo(cx - r, cy);
+    octx.closePath(); octx.stroke();
+    const r2 = Math.max(1, Math.round(r * t));
+    octx.beginPath();
+    octx.moveTo(cx, cy - r2); octx.lineTo(cx + r2, cy); octx.lineTo(cx, cy + r2); octx.lineTo(cx - r2, cy);
+    octx.closePath(); octx.fill();
+  } else if (kind === "xy") {
+    octx.fillRect(x, y + h / 2 - 1, w, 3);
+    octx.fillRect(x + Math.round((w - 6) * t), y + h / 2 - 2, 6, 5);
+    octx.fillStyle = inverted ? BG : FG;
+  } else if (kind === "curve") {
+    octx.beginPath();
+    for (let i = 0; i <= w; i++) {
+      const tt = i / w;
+      const g = 1 / Math.sqrt(1 + Math.pow(tt / 0.6, 6));
+      const yy = y + h - g * h;
+      i ? octx.lineTo(x + i, yy) : octx.moveTo(x + i, yy);
+    }
+    octx.stroke();
+  } else if (kind === "env") {
+    octx.beginPath();
+    octx.moveTo(x, y + h);
+    octx.lineTo(x + w * 0.2, y + 1);
+    octx.lineTo(x + w * 0.45, y + h * 0.45);
+    octx.lineTo(x + w * 0.72, y + h * 0.45);
+    octx.lineTo(x + w, y + h);
+    octx.stroke();
+  }
+}
+
+/* the FM algorithm / filter / envelope / LFO drawing, hardware position */
+function drawScreenGraphic(page, v) {
+  const X = 21, Y = 12, Wd = 25, Hd = 21;
+  octx.fillStyle = FG;
+  octx.strokeStyle = FG;
+  octx.lineWidth = 1;
+  const base = Y + Hd;
+
+  if (page === "FLTR") {
+    const fc = 0.15 + v(0) / MAXV * 0.7;
+    const res = v(1) / MAXV;
+    octx.beginPath();
+    for (let i = 0; i <= Wd; i++) {
+      const t = i / Wd;
+      const g = 1 / Math.sqrt(1 + Math.pow(t / fc, 8));
+      const bump = res * 0.9 * Math.exp(-Math.pow((t - fc) * 9, 2));
+      const val = Math.min(1.25, g * (1 + bump));
+      const yy = base - val * (Hd - 2);
+      i ? octx.lineTo(X + i, yy) : octx.moveTo(X + i, yy);
+    }
+    octx.stroke();
+    hLine(X, X + Wd, base);
+    return;
+  }
+  if (page === "AMP") {
+    const a = 0.04 + v(0) / MAXV * 0.16;
+    const d = 0.14 + v(1) / MAXV * 0.24;
+    const sus = v(2) / MAXV;
+    const r = 0.16 + v(3) / MAXV * 0.3;
+    const xs = [0, a, a + d, a + d + 0.24, a + d + 0.24 + r];
+    const top = Y + 2;
+    const ys = [base, top, base - sus * (Hd - 3), base - sus * (Hd - 3), base];
+    octx.beginPath();
+    for (let i = 0; i < xs.length; i++) {
+      const px = X + (xs[i] / xs[4]) * Wd;
+      i ? octx.lineTo(px, ys[i]) : octx.moveTo(px, ys[i]);
+    }
+    octx.stroke();
+    hLine(X, X + Wd, base);
+    return;
+  }
+  const shape = Math.round(v(1) / MAXV * 5);
+  const cyc = 1 + Math.round(v(0) / MAXV * 2);
+  const cy = Y + Hd / 2;
+  octx.beginPath();
+  for (let i = 0; i <= Wd; i++) {
+    const ph = ((i / Wd) * cyc) % 1;
+    let val;
+    if (shape === 1) val = 1 - 4 * Math.abs(ph - 0.5);
+    else if (shape === 2) val = ph < 0.5 ? 1 : -1;
+    else if (shape === 3) val = 1 - 2 * ph;
+    else if (shape === 4) val = ((i * 7) % 5) / 2 - 1;
+    else if (shape === 5) val = Math.pow(ph * 2 - 1, 3);
+    else val = Math.sin(ph * Math.PI * 2);
+    const yy = cy - val * (Hd / 2 - 2);
+    i ? octx.lineTo(X + i, yy) : octx.moveTo(X + i, yy);
+  }
+  octx.stroke();
+}
+
+const A0 = -Math.PI / 2 - Math.PI * 0.75;
+const SPAN = Math.PI * 1.5;
+
+function ring(x, y, r, value, hot) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, A0, A0 + SPAN);
+  ctx.strokeStyle = "rgba(255,255,255,.07)";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  const ang = A0 + clamp(value / MAXV, 0, 1) * SPAN;
+  if (value > 0) {
+    ctx.beginPath();
+    ctx.arc(x, y, r, A0, ang);
+    ctx.strokeStyle = hot ? "#ffbb55" : "rgba(255,204,0,.42)";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + Math.cos(ang) * (r - 20), y + Math.sin(ang) * (r - 20));
+  ctx.lineTo(x + Math.cos(ang) * (r - 8), y + Math.sin(ang) * (r - 8));
+  ctx.strokeStyle = hot ? "#ffe0a8" : "#e6e6ec";
+  ctx.lineWidth = 3.4;
+  ctx.lineCap = "round";
+  ctx.stroke();
+  ctx.lineCap = "butt";
+}
+
+function drawScreenRegion() {
+  if (oledDirty) renderOLED();
+  const s = G.screen;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(oled, s.x, s.y, s.w, s.h);
+  ctx.imageSmoothingEnabled = true;
+}
+
+function drawEncoderRegion(i) {
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page][i];
+  const pv = state.tracks[state.currentTrack].params[page];
+  const e = G.enc[i];
+  const sel = state.selParam === i;
+  ring(e.x, e.y, 32, pv[def.k], sel);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = F.small;
+  ctx.fillStyle = sel ? "#ffbb55" : "#77777f";
+  ctx.fillText(def.f(pv[def.k]), e.x, e.y + 57);
+  if (PRESSED.has("enc:" + i)) {
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, 27, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.22)";
+    ctx.fill();
+  }
+}
+
+function drawKnobRegion(k, idx) {
+  const hot = PRESSED.has("knob:" + idx);
+  ring(k.x, k.y, 35, idx === 0 ? state.masterVol : currentPageValue(state.selParam), hot);
+  if (hot) {
+    ctx.beginPath();
+    ctx.arc(k.x, k.y, 30, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.22)";
+    ctx.fill();
+  }
+}
+
+function goldFace(b) {
+  const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  g.addColorStop(0, "#f4c469");
+  g.addColorStop(0.5, "#d9a03c");
+  g.addColorStop(1, "#b1771f");
+  rr(ctx, b.x, b.y, b.w, b.h, 8);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,228,166,.7)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+function drawButtonRegion(b) {
+  const on = buttonActive(b.id);
+  if (b.page) {
+    if (on) goldFace(b);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "600 11px " + UI;
+    ctx.fillStyle = on ? "#1e1405" : "#d5d5dd";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+    ctx.fillStyle = on ? "rgba(40,26,6,.6)" : "rgba(255,204,0,.45)";
+    ctx.fillRect(b.x + b.w / 2 - 3, b.y + b.h - 8, 6, 2);
+  } else if (b.icon) {
+    if (on) {
+      rr(ctx, b.x, b.y, b.w, b.h, 8);
+      ctx.fillStyle = "rgba(255,176,64,.18)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(255,196,100,.55)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    drawIcon(b, on);
+  } else if (b.teal) {
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = F.btnLg;
+    ctx.fillStyle = "#04231f";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+    if (state.fine) {
+      rr(ctx, b.x + 1.5, b.y + 1.5, b.w - 3, b.h - 3, 6.5);
+      ctx.strokeStyle = "rgba(255,255,255,.92)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  } else if (on) {
+    goldFace(b);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = F.btn;
+    ctx.fillStyle = "#1e1405";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+  } else {
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = F.btn;
+    ctx.fillStyle = "#dcdce3";
+    ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 0.5);
+  }
+  if (PRESSED.has("btn:" + b.id)) {
+    rr(ctx, b.x, b.y + 1, b.w, b.h - 1, 8);
+    ctx.fillStyle = "rgba(0,0,0,.3)";
+    ctx.fill();
+  }
+}
+
+function drawIcon(b, on) {
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  ctx.fillStyle = on ? "#ffd479" : "#cfcfd8";
+  if (b.icon === "play") {
+    ctx.beginPath();
+    ctx.moveTo(cx - 5, cy - 7); ctx.lineTo(cx + 7, cy); ctx.lineTo(cx - 5, cy + 7);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "stop") {
+    ctx.fillRect(cx - 6, cy - 6, 12, 12);
+  } else if (b.icon === "up") {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 6); ctx.lineTo(cx + 6, cy + 4); ctx.lineTo(cx - 6, cy + 4);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "down") {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + 6); ctx.lineTo(cx + 6, cy - 4); ctx.lineTo(cx - 6, cy - 4);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "left") {
+    ctx.beginPath();
+    ctx.moveTo(cx - 6, cy); ctx.lineTo(cx + 4, cy - 6); ctx.lineTo(cx + 4, cy + 6);
+    ctx.closePath(); ctx.fill();
+  } else if (b.icon === "right") {
+    ctx.beginPath();
+    ctx.moveTo(cx + 6, cy); ctx.lineTo(cx - 4, cy - 6); ctx.lineTo(cx - 4, cy + 6);
+    ctx.closePath(); ctx.fill();
+  }
+}
+
+function buttonActive(id) {
+  if (id === "play") return state.isPlaying;
+  if (id === "func") return state.fine;
+  if (id === "unison") return state.unison;
+  if (id === "midi") return state.midi;
+  if (id.indexOf("page") === 0 && id.length === 5) return PAGES[+id.slice(4)] === state.currentPage;
+  return false;
+}
+
+function drawTrigRegion(t) {
+  const tr = state.tracks[state.currentTrack];
+  const on = tr.trigs[t.i] === 1;
+  const cur = state.isPlaying && state.currentStep === t.i;
+
+  if (on) {
+    if (!t._g) {
+      const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
+      g.addColorStop(0, "rgba(255,180,108,1)");
+      g.addColorStop(0.45, "rgba(255,140,58,1)");
+      g.addColorStop(1, "rgba(209,82,15,1)");
+      t._g = g;
+    }
+    rr(ctx, t.x, t.y, t.w, t.h, 9);
+    ctx.fillStyle = t._g;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,208,150,.6)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  if (PRESSED.has("trig:" + t.i)) {
+    rr(ctx, t.x, t.y + 1, t.w, t.h - 1, 9);
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.fill();
+  }
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = F.num;
+  ctx.fillStyle = on ? "#2b1200" : "rgba(196,196,206,.85)";
+  ctx.fillText(String(t.i + 1), t.x + t.w / 2, t.y + t.h / 2 + 1);
+
+  ctx.beginPath();
+  ctx.arc(t.x + 10, t.y + 10, 2.6, 0, 6.2832);
+  ctx.fillStyle = on ? "rgba(70,26,0,.9)" : "rgba(255,255,255,.14)";
+  ctx.fill();
+
+  if (cur) {
+    rr(ctx, t.x - 2, t.y - 2, t.w + 4, t.h + 4, 11);
+    ctx.strokeStyle = "rgba(255,255,255,.9)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+}
+
+function drawTrackRegion(t) {
+  const on = state.currentTrack === t.i;
+  const rgb = TRACK_RGB[t.i];
+  if (on) {
+    const g = ctx.createLinearGradient(0, t.y, 0, t.y + t.h);
+    g.addColorStop(0, "rgba(" + rgb + ",1)");
+    g.addColorStop(0.6, "rgba(" + rgb + ",.82)");
+    g.addColorStop(1, "rgba(" + rgb + ",.55)");
+    rr(ctx, t.x, t.y, t.w, t.h, 9);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,.55)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  } else {
+    rr(ctx, t.x + 1, t.y + 1, t.w - 2, t.h - 2, 8);
+    ctx.fillStyle = "rgba(" + rgb + ",.10)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(" + rgb + ",.35)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  if (PRESSED.has("track:" + t.i)) {
+    rr(ctx, t.x, t.y + 1, t.w, t.h - 1, 9);
+    ctx.fillStyle = "rgba(0,0,0,.25)";
+    ctx.fill();
+  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = F.track;
+  ctx.fillStyle = on ? "rgba(255,255,255,.98)" : "rgba(" + rgb + ",.85)";
+  ctx.fillText("T" + (t.i + 1), t.x + t.w / 2, t.y + t.h / 2 - 5);
+  ctx.font = F.tiny;
+  const muted = !!state.tracks[t.i].muted;
+  ctx.fillStyle = muted ? "rgba(255,255,255,.95)" : (on ? "rgba(255,255,255,.65)" : "rgba(255,255,255,.28)");
+  ctx.fillText(muted ? "MUTED" : "MUTE", t.x + t.w / 2, t.y + t.h - 13);
+  if (muted) {                                   /* struck-through = silent */
+    ctx.strokeStyle = "rgba(255,255,255,.75)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(t.x + 14, t.y + 12);
+    ctx.lineTo(t.x + t.w - 14, t.y + t.h - 12);
+    ctx.stroke();
+  }
+}
+
+function drawLedsRegion() {
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = "500 8.5px " + UI;
+  const beat = (state.isPlaying && state.currentStep >= 0) ? (state.currentStep >> 2) : 0;
+  for (let i = 0; i < 4; i++) {
+    const x = 806 + i * 46, y = 448;
+    const on = i === beat;
+    ctx.beginPath();
+    ctx.arc(x, y, 3.4, 0, 6.2832);
+    ctx.fillStyle = on ? "#ffb02e" : "#33333a";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,.6)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = on ? "#c9c9d2" : "#6e6e78";
+    ctx.fillText((i + 1) + ":4", x + 9, y + 0.5);
+  }
+}
+
+function drawRecRegion() {
+  const r = G.rec;
+  const t = performance.now();
+
+  ctx.beginPath();
+  ctx.arc(r.x, r.y, r.r + 2, 0, 6.2832);
+  ctx.fillStyle = "#191215";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.06)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  if (state.isRecordingWav) {
+    const pulse = 0.55 + 0.45 * Math.abs(Math.sin(t / 260));
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r + 6, 0, 6.2832);
+    ctx.strokeStyle = "rgba(255,60,44," + (0.28 * pulse).toFixed(3) + ")";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, 6.2832);
+    ctx.fillStyle = "rgba(255,52,36," + pulse.toFixed(3) + ")";
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(r.x - 3.5, r.y - 4, 3.2, 0, 6.2832);
+    ctx.fillStyle = "rgba(255,255,255,.28)";
+    ctx.fill();
+  } else {
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, 6.2832);
+    const g = ctx.createRadialGradient(r.x - 4, r.y - 5, 2, r.x, r.y, r.r);
+    g.addColorStop(0, "#74251f");
+    g.addColorStop(1, "#3a1210");
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255,90,74,.5)";
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  }
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = "700 9.5px " + UI;
+  ctx.fillStyle = state.isRecordingWav ? "#ff5a48" : "#c8c8d0";
+  ctx.fillText("REC", r.x + 19, r.y - 4);
+  ctx.font = F.tiny;
+  ctx.fillStyle = state.isRecordingWav ? "#ff8574" : "#6f6f79";
+  ctx.fillText(recTime(), r.x + 19, r.y + 9);
+
+  const s = G.saveWav;
+  rr(ctx, s.x, s.y, s.w, s.h, 7);
+  if (!s._off) {
+    const g = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+    g.addColorStop(0, "#2c2c32");
+    g.addColorStop(1, "#1e1e22");
+    s._off = g;
+    const g2 = ctx.createLinearGradient(0, s.y, 0, s.y + s.h);
+    g2.addColorStop(0, "#3d4137");
+    g2.addColorStop(1, "#282b24");
+    s._on = g2;
+  }
+  ctx.fillStyle = state.hasRec ? s._on : s._off;
+  ctx.fill();
+  ctx.strokeStyle = state.hasRec ? "rgba(255,204,0,.55)" : "rgba(255,255,255,.10)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.font = "700 8.5px " + UI;
+  ctx.fillStyle = state.hasRec ? "#ffd166" : "#a9a9b3";
+  ctx.fillText("SAVE WAV", s.x + s.w / 2, s.y + s.h / 2 + 0.5);
+
+  if (PRESSED.has("btn:rec")) {
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r + 2, 0, 6.2832);
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.fill();
+  }
+  if (PRESSED.has("btn:savewav")) {
+    rr(ctx, s.x, s.y, s.w, s.h, 7);
+    ctx.fillStyle = "rgba(0,0,0,.3)";
+    ctx.fill();
+  }
+}
+
+/* the only part of the status plate that changes while a knob is dragged */
+function drawFooterValue() {
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page][state.selParam];
+  const val = state.tracks[state.currentTrack].params[page][def.k];
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = F.small;
+  ctx.fillStyle = "#77777f";
+  ctx.fillText(page + "  /  " + def.l, 44, 703);
+  ctx.textAlign = "right";
+  ctx.font = "700 11px " + UI;
+  ctx.fillStyle = "#ffcc00";
+  ctx.fillText(def.f(val), 250, 703);
+  rr(ctx, 44, 712, 206, 4, 2);
+  ctx.fillStyle = "#26262b";
+  ctx.fill();
+  rr(ctx, 44, 712, Math.max(2, 206 * val / MAXV), 4, 2);
+  ctx.fillStyle = "#d9a03c";
+  ctx.fill();
+  ctx.textAlign = "left";
+}
+
+function drawFooterRegion() {
+  const tr = state.tracks[state.currentTrack];
+  const page = state.currentPage;
+  const def = PAGE_DEFS[page][state.selParam];
+  const val = tr.params[page][def.k];
+  const rgb = TRACK_RGB[state.currentTrack];
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+
+  ctx.beginPath();
+  ctx.arc(33, 663, 4.5, 0, 6.2832);
+  ctx.fillStyle = "rgba(" + rgb + ",1)";
+  ctx.fill();
+
+  ctx.font = F.foot;
+  ctx.fillStyle = "#f1f1f5";
+  ctx.fillText("TRACK " + (state.currentTrack + 1), 44, 663);
+
+  ctx.font = "600 9.5px " + UI;
+  ctx.fillStyle = "#8b8b95";
+  ctx.fillText(state.bank + state.patternNo + "  " + state.patternName, 44, 683);
+
+  drawFooterValue();
+  ctx.textAlign = "left";
+  ctx.font = F.small;
+  ctx.fillStyle = "#63636d";
+  ctx.fillText("TRIG 1\u201316 = STEPS \u00b7 TRACK AGAIN = MUTE", 300, 652);
+  ctx.fillText("DRAG A\u2013H UP / DOWN \u00b7 ARROWS NUDGE", 300, 668);
+  ctx.fillText("NO = UNDO \u00b7 YES = REDO \u00b7 FUNC = FINE / ALT", 300, 684);
+
+  ctx.textAlign = "right";
+  ctx.font = F.bpm;
+  ctx.fillStyle = "#f4f4f8";
+  ctx.fillText(state.bpm.toFixed(1), 776, 664);
+  ctx.textAlign = "left";
+  ctx.font = F.small;
+  ctx.fillStyle = "#6e6e78";
+  ctx.fillText("BPM", 784, 668);
+
+  ctx.beginPath();
+  ctx.arc(700, 700, 4, 0, 6.2832);
+  ctx.fillStyle = state.isPlaying ? "#ff9f43" : "#3a3a42";
+  ctx.fill();
+  ctx.font = "600 9.5px " + UI;
+  ctx.fillStyle = state.isPlaying ? "#ffb45e" : "#77777f";
+  ctx.fillText(state.isPlaying ? "PLAYING" : "STOPPED", 712, 700);
+
+  ctx.textAlign = "right";
+  ctx.fillStyle = state.isRecordingWav ? "#ff5a48" : (state.hasRec ? "#b9a25a" : "#5f5f69");
+  ctx.fillText(state.isRecordingWav ? "REC " + recTime() : (state.hasRec ? "WAV READY" : "NO WAV"), 966, 700);
+
+  const now = performance.now();
+  if (state.msg && now < state.msgUntil) {
+    const a = Math.min(1, (state.msgUntil - now) / 300);
+    ctx.textAlign = "center";
+    ctx.font = "700 11px " + UI;
+    ctx.fillStyle = "rgba(255,204,0," + a.toFixed(2) + ")";
+    ctx.fillText(state.msg, 520, 718);
+  }
+}
+
+/* --------------------------------------------------- 5. REGION DEFINITIONS */
+
+function buildRegions() {
+  REGIONS.clear();
+  const s = G.screen;
+  addRegion("screen", s.x, s.y, s.w, s.h, drawScreenRegion);
+
+  for (let i = 0; i < 8; i++) {
+    const e = G.enc[i];
+    addRegion("enc:" + i, e.x - 40, e.y - 40, 80, 104, () => drawEncoderRegion(i));
+  }
+  G.knobs.forEach((k, i) => {
+    addRegion("knob:" + i, k.x - 42, k.y - 42, 84, 108, () => drawKnobRegion(k, i));
+  });
+  for (const b of BTNS) {
+    addRegion("btn:" + b.id, b.x - 2, b.y - 2, b.w + 4, b.h + 4, () => drawButtonRegion(b));
+  }
+  for (const t of TRIGS) {
+    addRegion("trig:" + t.i, t.x - 3, t.y - 3, t.w + 6, t.h + 6, () => drawTrigRegion(t));
+  }
+  for (const t of TRACKBTN) {
+    addRegion("track:" + t.i, t.x - 3, t.y - 3, t.w + 6, t.h + 6, () => drawTrackRegion(t));
+  }
+  addRegion("leds", 790, 434, 190, 28, drawLedsRegion);
+  addRegion("rec", G.recPanel.x, G.recPanel.y, G.recPanel.w, G.recPanel.h, drawRecRegion);
+  addRegion("footer", G.footer.x, G.footer.y, G.footer.w, G.footer.h, drawFooterRegion);
+  addRegion("fval", 36, 690, 222, 30, drawFooterValue);
+}
+buildRegions();
+
+/* ============================================================== 6. INPUT */
+
+const PRESSED = new Set();
+
+function canvasPoint(cx, cy) {
+  return { x: (cx - panelRect.left) / panelRect.width * W,
+           y: (cy - panelRect.top) / panelRect.height * H };
+}
+
+const HITS = [];
+function buildHits() {
+  HITS.length = 0;
+  for (let i = 0; i < 8; i++) HITS.push({ k: "enc:" + i, t: "enc", i: i, x: G.enc[i].x, y: G.enc[i].y, r: 38 });
+  G.knobs.forEach((k, i) => HITS.push({ k: "knob:" + i, t: "knob", i: i, x: k.x, y: k.y, r: 40 }));
+  for (const t of TRIGS) HITS.push({ k: "trig:" + t.i, t: "trig", i: t.i, x: t.x, y: t.y, w: t.w, h: t.h });
+  for (const t of TRACKBTN) HITS.push({ k: "track:" + t.i, t: "track", i: t.i, x: t.x, y: t.y, w: t.w, h: t.h });
+  for (const b of BTNS) HITS.push({ k: "btn:" + b.id, t: "btn", id: b.id, x: b.x, y: b.y, w: b.w, h: b.h });
+  const s = G.saveWav;
+  HITS.push({ k: "btn:savewav", t: "btn", id: "savewav", x: s.x, y: s.y, w: s.w, h: s.h });
+  HITS.push({ k: "btn:rec", t: "rec", id: "rec", x: G.rec.x, y: G.rec.y, r: G.rec.r + 10 });
+}
+buildHits();
+
+function hitTest(x, y) {
+  for (let i = HITS.length - 1; i >= 0; i--) {
+    const h = HITS[i];
+    if (h.w) {
+      if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h;
+    } else {
+      const dx = x - h.x, dy = y - h.y;
+      if (dx * dx + dy * dy <= h.r * h.r) return h;
+    }
+  }
+  return null;
+}
+
+const drags = new Map();          /* finger id -> drag state (applied per frame) */
+
+function currentPageValue(i) {
+  const d = PAGE_DEFS[state.currentPage][i];
+  return state.tracks[state.currentTrack].params[state.currentPage][d.k];
+}
+function setParam(i, v) {
+  const page = state.currentPage;
+  const d = PAGE_DEFS[page][i];
+  state.tracks[state.currentTrack].params[page][d.k] = clamp(Math.round(v), 0, MAXV);
+  if (state.selParam !== i) {
+    const prev = state.selParam;
+    state.selParam = i;
+    touch("enc:" + prev);
+    oledDirty = true;
+    touch("screen");
+  }
+  oledDirty = true;
+  touch("enc:" + i);
+  touch("screen");
+  touch("footer");
+}
+
+function applyDrags() {
+  for (const d of drags.values()) {
+    if (!d.moved) continue;
+    d.moved = false;
+    const sens = d.kind === "knob" ? 0.42 : (state.fine ? 0.20 : 0.62);
+    const v = clamp(d.v0 + (d.y0 - d.py) * sens, 0, MAXV);
+    if (d.kind === "enc") {
+      setParam(d.i, v);
+    } else if (d.i === 0) {
+      state.masterVol = Math.round(v);
+      if (masterGain) masterGain.gain.value = gainFromVolume();
+      touch("knob:0");
+    } else {
+      setParam(state.selParam, v);
+      touch("knob:1");
+    }
+  }
+}
+
+function pointerDown(px, py, id) {
+  const hit = hitTest(px, py);
+  if (!hit) return;
+
+  if (hit.t === "enc") {
+    const prev = state.selParam;
+    state.selParam = hit.i;
+    oledDirty = true;
+    touch("screen");
+    drags.set(id, { kind: "enc", i: hit.i, y0: py, py: py, v0: currentPageValue(hit.i), moved: false });
+    PRESSED.add(hit.k);
+    touch(hit.k);
+    if (prev !== hit.i) touch("enc:" + prev);
+    return;
+  }
+  if (hit.t === "knob") {
+    const base = hit.i === 0 ? state.masterVol : currentPageValue(state.selParam);
+    drags.set(id, { kind: "knob", i: hit.i, y0: py, py: py, v0: base, moved: false });
+    PRESSED.add(hit.k);
+    touch(hit.k);
+    return;
+  }
+  if (hit.t === "trig") {
+    const tr = state.tracks[state.currentTrack];
+    tr.trigs[hit.i] = tr.trigs[hit.i] ? 0 : 1;
+    if (tr.trigs[hit.i]) previewVoice(state.currentTrack, hit.i);
+    oledDirty = true;
+    touch("trig:" + hit.i);
+    return;
+  }
+  if (hit.t === "track") {
+    selectTrack(hit.i);
+    return;
+  }
+  /* buttons + REC */
+  pressButton(hit.id);
+  PRESSED.add(hit.k);
+  touch(hit.k);
+  setTimeout(() => { PRESSED.delete(hit.k); touch(hit.k); }, 110);
+}
+
+function pointerMove(px, py, id) {
+  const d = drags.get(id);
+  if (!d) return;
+  d.py = py;                 /* coalesced: applied once in the next frame */
+  d.moved = true;
+  invalidate();
+}
+
+function pointerUp(id) {
+  const d = drags.get(id);
+  if (!d) return;
+  if (d.moved) { applyDrags(); }
+  drags.delete(id);
+  const key = d.kind === "enc" ? "enc:" + d.i : "knob:" + d.i;
+  PRESSED.delete(key);
+  touch(key);
+}
+
+/* touch ------------------------------------------------------------------- */
+panelEl.addEventListener("touchstart", e => {
+  e.preventDefault();
+  audioUnlock();
+  const t = e.changedTouches;
+  for (let i = 0; i < t.length; i++) {
+    const p = canvasPoint(t[i].clientX, t[i].clientY);
+    pointerDown(p.x, p.y, t[i].identifier);
+  }
+}, { passive: false });
+
+panelEl.addEventListener("touchmove", e => {
+  e.preventDefault();
+  const t = e.changedTouches;
+  for (let i = 0; i < t.length; i++) {
+    const p = canvasPoint(t[i].clientX, t[i].clientY);
+    pointerMove(p.x, p.y, t[i].identifier);
+  }
+}, { passive: false });
+
+function endTouch(e) {
+  for (let i = 0; i < e.changedTouches.length; i++) pointerUp(e.changedTouches[i].identifier);
+}
+panelEl.addEventListener("touchend", endTouch, { passive: true });
+panelEl.addEventListener("touchcancel", endTouch, { passive: true });
+
+/* mouse (desktop) ---------------------------------------------------------- */
+let mouseDown = false;
+panelEl.addEventListener("mousedown", e => {
+  e.preventDefault();
+  audioUnlock();
+  const p = canvasPoint(e.clientX, e.clientY);
+  mouseDown = true;
+  pointerDown(p.x, p.y, "mouse");
+});
+window.addEventListener("mousemove", e => {
+  if (!mouseDown) return;
+  const p = canvasPoint(e.clientX, e.clientY);
+  pointerMove(p.x, p.y, "mouse");
+});
+window.addEventListener("mouseup", () => {
+  if (!mouseDown) return;
+  mouseDown = false;
+  pointerUp("mouse");
+});
+
+panelEl.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("gesturestart", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+
+/* =========================================================== 7. ACTIONS */
+
+function selectTrack(i) {
+  if (state.currentTrack === i) {          /* second tap = mute, like FUNC+TRACK */
+    const tr = state.tracks[i];
+    tr.muted = !tr.muted;
+    touch("track:" + i);
+    toast("TRACK " + (i + 1) + (tr.muted ? " MUTED" : " UNMUTED"));
+    return;
+  }
+  touch("track:" + state.currentTrack);
+  state.currentTrack = i;
+  state.selParam = 0;
+  oledDirty = true;
+  touch("track:" + i);
+  touch("screen");
+  touch("footer");
+  for (let k = 0; k < 16; k++) touch("trig:" + k);
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
+}
+
+function nextPage(dir) {
+  const i = PAGES.indexOf(state.currentPage);
+  const prev = i;
+  state.currentPage = PAGES[(i + dir + PAGES.length) % PAGES.length];
+  state.selParam = 0;
+  oledDirty = true;
+  touch("screen");
+  touch("footer");
+  touch("btn:page" + prev);
+  touch("btn:page" + PAGES.indexOf(state.currentPage));
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
+}
+
+function nudge(dir) {
+  const step = state.fine ? 10 : 1;
+  setParam(state.selParam, currentPageValue(state.selParam) + dir * step);
+}
+
+function setBpm(v) {
+  const nb = clamp(Math.round(v * 10) / 10, 30, 300);
+  if (nb === state.bpm) return;
+  state.bpm = nb;
+  oledDirty = true;
+  touch("screen");
+  touch("footer");
+}
+
+function toggleMidi() {
+  if (!navigator || !navigator.requestMIDIAccess) { toast("MIDI NOT AVAILABLE"); return; }
+  if (state.midi) {
+    state.midi = false;
+    touch("btn:midi");
+    toast("MIDI INPUT OFF");
+    return;
+  }
+  navigator.requestMIDIAccess({ sysex: false }).then(access => {
+    state.midi = true;
+    touch("btn:midi");
+    let count = 0;
+    access.inputs.forEach(inp => {
+      count++;
+      inp.onmidimessage = ev => {
+        const d = ev.data;
+        const cmd = d[0] & 0xf0;
+        if (cmd === 0x90 && d[2] > 0) previewVoice(state.currentTrack, d[1] % 8);
+      };
+    });
+    toast("MIDI IN \u00b7 " + count + " DEVICE" + (count === 1 ? "" : "S"));
+  }).catch(() => toast("MIDI DENIED"));
+}
+
+let clip = null;
+
+function copyTrack() {
+  const t = state.tracks[state.currentTrack];
+  clip = { trigs: t.trigs.slice(), params: JSON.parse(JSON.stringify(t.params)), muted: !!t.muted };
+  toast("TRACK " + (state.currentTrack + 1) + " COPIED");
+  touch("btn:paste");
+}
+
+function pasteTrack() {
+  if (!clip) { toast("NOTHING TO PASTE \u00b7 PRESS COPY"); return; }
+  pushUndo("PASTE");
+  const t = state.tracks[state.currentTrack];
+  t.trigs = clip.trigs.slice();
+  t.params = JSON.parse(JSON.stringify(clip.params));
+  t.muted = !!clip.muted;
+  state.selParam = 0;
+  refreshAll();
+  toast("PASTED TO TRACK " + (state.currentTrack + 1));
+}
+
+function clearTrack() {
+  pushUndo("CLEAR");
+  const t = state.tracks[state.currentTrack];
+  t.trigs.fill(0);
+  for (const pg of PAGES) Object.assign(t.params[pg], JSON.parse(JSON.stringify(PAGE_DEFAULTS[pg])));
+  refreshAll();
+  toast("TRACK " + (state.currentTrack + 1) + " CLEARED \u00b7 NO = UNDO");
+}
+
+/* one call that repaints everything a structural change can touch */
+function refreshAll() {
+  oledDirty = true;
+  touch("screen");
+  touch("footer");
+  touch("fval");
+  for (let k = 0; k < 16; k++) touch("trig:" + k);
+  for (let k = 0; k < 8; k++) touch("enc:" + k);
+  for (let k = 0; k < 4; k++) touch("track:" + k);
+}
+
+function pressButton(id) {
+  if (id.indexOf("page") === 0 && id.length === 5) {
+    const idx = +id.slice(4);
+    const prev = PAGES.indexOf(state.currentPage);
+    if (idx === prev) { toast(PAGES[idx] + " PAGE"); return; }
+    state.currentPage = PAGES[idx];
+    state.selParam = 0;
+    oledDirty = true;
+    touch("screen");
+    touch("footer");
+    touch("fval");
+    touch("btn:page" + prev);
+    touch("btn:page" + idx);
+    for (let k = 0; k < 8; k++) touch("enc:" + k);
+    return;
+  }
+  switch (id) {
+    case "play":   if (state.isPlaying) stopPlay(); else startPlay(); break;
+    case "stop":   stopPlay(); break;
+    case "yes":    doRedo(); break;
+    case "no":     doUndo(); break;
+    case "copy":   copyTrack(); break;
+    case "clear":  clearTrack(); break;
+    case "paste":  pasteTrack(); break;
+    case "saveprj": saveProject(); break;
+    case "impexp": if (state.fine) importProject(); else exportProject(); break;
+    case "unison":
+      state.unison = !state.unison;
+      touch("btn:unison");
+      toast("UNISON " + (state.unison ? "ON \u00b7 3 VOICES" : "OFF"));
+      break;
+    case "func":
+      state.fine = !state.fine;
+      touch("btn:func");
+      toast(state.fine ? "FUNC ON \u00b7 FINE / ALT" : "FUNC OFF");
+      break;
+    case "taptempo": tapTempo(); break;
+    case "midi":   toggleMidi(); break;
+    case "page":   nextPage(1); break;
+    case "left":   state.fine ? selectTrack((state.currentTrack + 3) % 4) : nextPage(-1); break;
+    case "right":  state.fine ? selectTrack((state.currentTrack + 1) % 4) : nextPage(1); break;
+    case "up":     state.fine ? setBpm(state.bpm + 1) : nudge(1); break;
+    case "down":   state.fine ? setBpm(state.bpm - 1) : nudge(-1); break;
+    case "savewav": saveWav(); break;
+    case "rec":    toggleRec(); break;
+    default: toast("?" + id);
+  }
+}
+
+let lastTap = 0;
+const tapGaps = [];
+function tapTempo() {
+  const now = performance.now();
+  if (now - lastTap > 2000) tapGaps.length = 0;
+  if (lastTap) tapGaps.push(now - lastTap);
+  lastTap = now;
+  if (tapGaps.length) {
+    const avg = tapGaps.reduce((a, b) => a + b, 0) / tapGaps.length;
+    const bpm = clamp(Math.round(600000 / avg) / 10, 30, 300);
+    setBpm(bpm);
+    toast("BPM " + bpm.toFixed(1));
+  }
+}
+
+function toast(msg) {
+  state.msg = msg;
+  state.msgUntil = performance.now() + 1700;
+  touch("footer");
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => touch("footer"), 1780);
+}
+
+/* history ------------------------------------------------------------------ */
+const undoStack = [], redoStack = [];
+
+function serialize() {
+  return {
+    tracks: state.tracks.map(t => ({
+      trigs: t.trigs.slice(),
+      params: JSON.parse(JSON.stringify(t.params)),
+      muted: !!t.muted,
+      octave: t.octave || 0
+    })),
+    bpm: state.bpm,
+    masterVol: state.masterVol,
+    patternName: state.patternName,
+    bank: state.bank,
+    patternNo: state.patternNo,
+    unison: !!state.unison
+  };
+}
+
+function applyState(d) {
+  if (!d || !d.tracks || d.tracks.length !== 4) return false;
+  for (let i = 0; i < 4; i++) {
+    const src = d.tracks[i];
+    const trigs = new Array(16).fill(0);
+    (src.trigs || []).forEach((v, k) => { if (k < 16) trigs[k] = v ? 1 : 0; });
+    state.tracks[i].trigs = trigs;
+    state.tracks[i].muted = !!src.muted;
+    if (typeof src.octave === "number") state.tracks[i].octave = src.octave;
+    if (src.params) for (const pg of PAGES) if (src.params[pg]) Object.assign(state.tracks[i].params[pg], src.params[pg]);
+  }
+  if (typeof d.bpm === "number") state.bpm = clamp(d.bpm, 30, 300);
+  if (typeof d.masterVol === "number") state.masterVol = clamp(d.masterVol, 0, 127);
+  if (typeof d.patternName === "string") state.patternName = d.patternName.slice(0, 16).toUpperCase();
+  if (typeof d.bank === "string") state.bank = d.bank.slice(0, 1);
+  if (typeof d.patternNo === "string") state.patternNo = d.patternNo.slice(0, 2);
+  if (typeof d.unison === "boolean") state.unison = d.unison;
+  oledDirty = true;
+  touchAll();
+  return true;
+}
+
+function pushUndo(label) {
+  undoStack.push({ label: label, data: serialize() });
+  if (undoStack.length > 16) undoStack.shift();
+  redoStack.length = 0;
+  touch("btn:no");
+  touch("btn:yes");
+}
+
+function refreshHistoryButtons() {
+  touch("btn:no");
+  touch("btn:yes");
+  touch("footer");
+}
+
+function doUndo() {
+  if (!undoStack.length) { toast("NOTHING TO UNDO"); return; }
+  const e = undoStack.pop();
+  redoStack.push({ label: e.label, data: serialize() });
+  applyState(e.data);
+  refreshHistoryButtons();
+  toast("UNDO \u00b7 " + e.label);
+}
+
+function doRedo() {
+  if (!redoStack.length) { toast("NOTHING TO REDO"); return; }
+  const e = redoStack.pop();
+  undoStack.push({ label: e.label, data: serialize() });
+  applyState(e.data);
+  refreshHistoryButtons();
+  toast("REDO \u00b7 " + e.label);
+}
+
+/* persistence ------------------------------------------------------------- */
+const STORE_KEY = "digitone.panel.v3";
+function saveProject() {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(serialize()));
+    toast("PROJECT SAVED");
+  } catch (err) { toast("SAVE FAILED"); }
+}
+
+function loadProject(silent) {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) { if (!silent) toast("NO PROJECT FOUND"); return false; }
+    if (!applyState(JSON.parse(raw))) { if (!silent) toast("BAD PROJECT"); return false; }
+    if (!silent) toast("PROJECT LOADED");
+    return true;
+  } catch (err) {
+    if (!silent) toast("LOAD FAILED");
+    return false;
+  }
+}
+
+/* file export / import ---------------------------------------------------- */
+function exportProject() {
+  try {
+    const blob = new Blob([JSON.stringify(serialize())], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "digitone-" + state.bank + state.patternNo + ".json";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 6000);
+    toast("EXPORTED " + state.bank + state.patternNo);
+  } catch (err) { toast("EXPORT FAILED"); }
+}
+
+function importProject() {
+  const inp = document.getElementById("filein");
+  if (!inp) { toast("NO FILE PICKER"); return; }
+  inp.value = "";
+  inp.click();
+}
+
+function readProjectFile(file) {
+  const r = new FileReader();
+  r.onerror = () => toast("IMPORT FAILED");
+  r.onload = () => {
+    try {
+      const d = JSON.parse(String(r.result));
+      if (applyState(d)) { pushUndo("IMPORT"); toast("IMPORTED " + (d.bank || "") + (d.patternNo || "")); }
+      else toast("BAD PROJECT FILE");
+    } catch (e) { toast("NOT A PROJECT FILE"); }
+  };
+  r.readAsText(file);
+}
+
+let actx = null, masterGain = null;
+/* REC bounces the song offline: the audio thread renders it, the main thread
+   never sees a single sample callback, so the UI cannot drop a frame.        */
+let recBuffer = null, recLen = 0, recStart = 0, recBusy = false;
+const REC_BARS = 8;
+
+function gainFromVolume() { return Math.pow(state.masterVol / MAXV, 1.5) * 0.55; }
+
+function audioUnlock() {
+  try {
+    if (!actx) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      actx = new Ctor();
+      masterGain = actx.createGain();
+      masterGain.gain.value = gainFromVolume();
+      masterGain.connect(actx.destination);
+
+    }
+    if (actx.state === "suspended") actx.resume();
+  } catch (err) { actx = null; }
+}
+
+function buildVoice(c, dest, trackIdx, step, when, detune, gainDiv) {
+  const tr = state.tracks[trackIdx];
+  const syn = tr.params.SYN1, flt = tr.params.FLTR, amp = tr.params.AMP;
+
+  const scale = [0, 3, 5, 7, 10, 12, 15, 17];
+  const f = 55 * Math.pow(2, (scale[step % 8] + (tr.octave || 0)) / 12);
+  const rat = 0.5 + (syn.ratioA / MAXV) * 7.5;
+  const idx = (syn.feedback / MAXV) * 5 + 0.2;
+
+  const car = c.createOscillator();
+  const mod = c.createOscillator();
+  const modGain = c.createGain();
+  const vca = c.createGain();
+  const lp = c.createBiquadFilter();
+
+  car.type = "sine"; mod.type = "sine";
+  car.frequency.value = f * (0.5 + (syn.ratioC / MAXV) * 1.5);
+  mod.frequency.value = car.frequency.value * rat;
+  modGain.gain.value = car.frequency.value * idx;
+  if (detune) car.detune.value = detune;
+
+  lp.type = "lowpass";
+  lp.frequency.value = Math.min(16000, 80 * Math.pow(2, (flt.freq / MAXV) * 7.4));
+  lp.Q.value = 0.4 + (flt.resonance / MAXV) * 14;
+
+  mod.connect(modGain);
+  modGain.connect(car.frequency);
+  car.connect(lp);
+  lp.connect(vca);
+  vca.connect(dest);
+
+  const t = Math.max(0.002, when);
+  const peak = 0.16 * (amp.volume / MAXV) * (gainDiv || 1);
+  const a = 0.004 + Math.pow(amp.attack / MAXV, 2) * 0.5;
+  const d = 0.03 + (amp.decay / MAXV) * 1.1;
+  const sus = Math.max(0.001, amp.sustain / MAXV);
+  const hold = 0.12;
+  const r = 0.03 + (amp.release / MAXV) * 1.0;
+  const end = t + a + d + hold + r;
+
+  vca.gain.setValueAtTime(0.0001, t);
+  vca.gain.linearRampToValueAtTime(peak, t + a);
+  vca.gain.exponentialRampToValueAtTime(Math.max(0.0001, peak * sus), t + a + d);
+  vca.gain.setValueAtTime(Math.max(0.0001, peak * sus), t + a + d + hold);
+  vca.gain.exponentialRampToValueAtTime(0.0001, end);
+
+  car.start(t); mod.start(t);
+  car.stop(end + 0.02); mod.stop(end + 0.02);
+  car.onended = () => {
+    try {
+      car.disconnect(); mod.disconnect(); modGain.disconnect();
+      vca.disconnect(); lp.disconnect();
+    } catch (e) {}
+  };
+}
+
+function voicesInto(c, dest, trackIdx, step, when) {
+  if (state.unison) {
+    /* three detuned partials: the classic Digitone unison spread */
+    buildVoice(c, dest, trackIdx, step, when, -9, 0.55);
+    buildVoice(c, dest, trackIdx, step, when, 0, 0.7);
+    buildVoice(c, dest, trackIdx, step, when, 9, 0.55);
+  } else {
+    buildVoice(c, dest, trackIdx, step, when, 0, 1);
+  }
+}
+
+function voice(trackIdx, step, when) {
+  if (actx) voicesInto(actx, masterGain, trackIdx, step, when);
+}
+
+function previewVoice(trackIdx, step) {
+  audioUnlock();
+  if (actx) voice(trackIdx, step);
+}
+
+/* ---------------------------------------------------------- 9. SEQUENCER */
+
+let seqTimer = null, nextTime = 0, schedStep = 0;
+const pending = [];
+
+function startPlay() {
+  if (state.isPlaying) return;
+  audioUnlock();
+  state.isPlaying = true;
+  state.currentStep = -1;
+  schedStep = 0;
+  pending.length = 0;
+  if (actx) {
+    nextTime = actx.currentTime + 0.06;
+    seqTimer = setInterval(scheduler, 25);
+  } else {
+    seqTimer = setInterval(() => {
+      advanceStep((state.currentStep + 1) % 16);
+    }, 60000 / (state.bpm * 4));
+  }
+  oledDirty = true;
+  touch("btn:play");
+  touch("btn:stop");
+  touch("screen");
+}
+
+function stopPlay() {
+  if (seqTimer) { clearInterval(seqTimer); seqTimer = null; }
+  state.isPlaying = false;
+  const prev = state.currentStep;
+  state.currentStep = -1;
+  pending.length = 0;
+  if (prev >= 0) touch("trig:" + prev);
+  oledDirty = true;
+  touch("btn:play");
+  touch("btn:stop");
+  touch("screen");
+  touch("footer");
+}
+
+function scheduler() {
+  if (!state.isPlaying || !actx) return;
+  const spb = 60 / (state.bpm * 4);
+  let guard = 0;
+  while (nextTime < actx.currentTime + 0.15 && guard++ < 32) {
+    const s = schedStep % 16;
+    for (let t = 0; t < 4; t++) {
+      const tr = state.tracks[t];
+      if (tr.muted) continue;
+      if (tr.trigs[s]) voice(t, s, nextTime);
+    }
+    pending.push({ s: s, t: nextTime });
+    if (pending.length > 24) pending.shift();
+    nextTime += spb;
+    schedStep++;
+  }
+  consumeScheduledSteps();      /* the step LEDs are driven from here, not rAF */
+}
+
+function advanceStep(s) {
+  const prev = state.currentStep;
+  state.currentStep = s;
+  if (prev >= 0) touch("trig:" + prev);
+  touch("trig:" + s);
+  if ((prev >> 2) !== (s >> 2)) touch("leds");        /* 1:4 .. 4:4 indicator */
+}
+
+function consumeScheduledSteps() {
+  if (!actx) return;
+  const now = actx.currentTime;
+  while (pending.length && pending[0].t <= now) advanceStep(pending.shift().s);
+}
+
+/* ------------------------------------------------------------ 10. REC/WAV */
+
+function fmtTime(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s;
+}
+function recTime() {
+  if (recBusy) return "BUSY";
+  if (recLen) return fmtTime(recLen / 44100);
+  return "00:00";
+}
+
+function toggleRec() {
+  audioUnlock();
+  if (recBusy) { toast("BOUNCE IN PROGRESS"); return; }
+  startRec();
+}
+
+/* the whole song is rendered in an OfflineAudioContext - exact same synth
+   graph, but it runs faster than real time and never touches the UI thread */
+function startRec() {
+  const Ctor = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!Ctor) { toast("NO OFFLINE AUDIO HERE"); return; }
+  if (recBusy) return;
+
+  recBusy = true;
+  state.isRecordingWav = true;
+  state.hasRec = false;
+  recStart = performance.now();
+  toast("BOUNCING " + REC_BARS + " BARS");
+  touch("rec");
+  touch("footer");
+
+  const sr = 44100;
+  const spb = 60 / (state.bpm * 4);
+  const steps = 16 * REC_BARS;
+  const dur = Math.min(120, steps * spb + 2.2);
+  const oac = new Ctor(1, Math.ceil(dur * sr), sr);
+  const out = oac.createGain();
+  out.gain.value = gainFromVolume();
+  out.connect(oac.destination);
+
+  for (let i = 0; i < steps; i++) {
+    const when = 0.05 + i * spb;
+    const s16 = i % 16;
+    for (let t = 0; t < 4; t++) {
+      const tr = state.tracks[t];
+      if (tr.muted || !tr.trigs[s16]) continue;
+      voicesInto(oac, out, t, s16, when);
+    }
+  }
+
+  const done = buf => {
+    recBuffer = buf.getChannelData(0);           /* copies on first access */
+    recLen = recBuffer.length;
+    recBusy = false;
+    state.isRecordingWav = false;
+    state.hasRec = recLen > 0;
+    toast("CAPTURED " + fmtTime(recLen / sr));
+    touch("rec");
+    touch("footer");
+  };
+  oac.startRendering().then(done).catch(() => {
+    recBusy = false;
+    state.isRecordingWav = false;
+    toast("RENDER FAILED");
+    touch("rec");
+    touch("footer");
+  });
+}
+
+function stopRec() {                       /* cancel a running bounce */
+  if (!recBusy) return;
+  recBusy = false;
+  state.isRecordingWav = false;
+  toast("BOUNCE CANCELLED");
+  touch("rec");
+  touch("footer");
+}
+
+function encodeWav() {
+  const sr = 44100;
+  const n = recLen;
+  const d = recBuffer;
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); view.setUint32(4, 36 + n * 2, true); str(8, "WAVE");
+  str(12, "fmt "); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true); view.setUint32(24, sr, true); view.setUint32(28, sr * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  str(36, "data"); view.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++) {
+    const v = d[i] < -1 ? -1 : (d[i] > 1 ? 1 : d[i]);
+    view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    off += 2;
+  }
+  return new Blob([view], { type: "audio/wav" });
+}
+
+function saveWav() {
+  if (!recLen) { toast("NO RECORDING \u2014 PRESS REC"); return; }
+  try {
+    const url = URL.createObjectURL(encodeWav());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "digitone-" + Date.now() + ".wav";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 6000);
+    toast("SAVING WAV");
+  } catch (err) {
+    toast("EXPORT FAILED");
+  }
+}
+
+/* ============================================================== 11. BOOT */
+
+ATLAS.fg = buildAtlas(FG);
+ATLAS.bg = buildAtlas(BG);
+ATLAS_S.fg = buildAtlasS(FG);
+ATLAS_S.bg = buildAtlasS(BG);
+octx.imageSmoothingEnabled = false;
+
+const fileIn = document.getElementById("filein");
+if (fileIn) fileIn.addEventListener("change", e => {
+  const f = e.target.files && e.target.files[0];
+  if (f) readProjectFile(f);
+});
+
+buildHits();
+resize();
+loadProject(true);
+if (visualViewport) visualViewport.addEventListener("resize", resize, { passive: true });
+oledDirty = true;
+drawUI();
+if (masterGain) masterGain.gain.value = gainFromVolume();
+invalidate();
+</script>
+</body>
+</html>
